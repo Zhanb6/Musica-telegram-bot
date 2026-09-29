@@ -30,6 +30,8 @@ HISTORY_DB = Path(__file__).with_name("downloads.sqlite3")
 MAX_FILE_BYTES = 50_000_000  # Telegram Bot API upload limit
 MAX_BATCH = 10
 PLAYLIST_LIMIT = 30
+AUTO_PLAYLIST_SCAN_LIMIT = 150
+AUTO_PLAYLIST_DOWNLOAD_LIMIT = 30
 PLAYLIST_PAGE_SIZE = 8
 MAX_PLAYLIST_SELECTION = 150
 ARTIST_TOPIC_THRESHOLD = 5
@@ -598,7 +600,7 @@ def download_media(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "Пришлите одну или несколько ссылок на видео YouTube (до 10 в одном сообщении). "
-        "Если пришлёте ссылку на Mix, можно будет выбрать треки из списка. "
+        "Если пришлёте ссылку на Mix, можно будет выбрать треки из списка или скачать 30 новых MP3 одной кнопкой. "
         "Я предложу скачать MP3 или MP4 и выбрать качество. "
         "Файл должен быть не больше 50 МБ. Во время загрузки можно нажать «Отменить», "
         "а неудачные ссылки повторить кнопкой. /artists — разделы музыки, /search — поиск, "
@@ -640,6 +642,10 @@ def playlist_markup(job_id: str, job: dict) -> InlineKeyboardMarkup:
             f"🔎 Почему скрыты ({len(job['reasons'])})",
             callback_data=f"mix:{job_id}:why:show",
         )])
+    if entries or job.get("has_more"):
+        rows.append([InlineKeyboardButton(
+            "⚡ Скачать 30 новых MP3", callback_data=f"mix:{job_id}:auto:mp3",
+        )])
     if entries:
         rows.append([
             InlineKeyboardButton("✅ Выбрать все", callback_data=f"mix:{job_id}:select:all"),
@@ -672,7 +678,43 @@ def playlist_text(job: dict) -> str:
         text += f"\nЗа одну загрузку можно выбрать до {MAX_PLAYLIST_SELECTION} треков."
     if job.get("page_error"):
         text += "\nСледующую страницу пока не удалось получить. Попробуйте ещё раз."
+    if job.get("auto_notice"):
+        text += f"\n{job['auto_notice']}"
     return text
+
+
+async def collect_auto_playlist(job: dict) -> tuple[list[tuple[str, str, str]], int]:
+    """Find up to 30 unsent tracks while inspecting no more than 150 Mix positions."""
+    chat_id = job["source_chat_id"]
+    entries = job["entries"]
+    start = job["next_start"]
+    has_more = job["has_more"]
+    if start > AUTO_PLAYLIST_SCAN_LIMIT + 1:
+        entries, start, has_more = [], 1, True
+    chosen = []
+    seen_ids = set()
+    seen_keys = set()
+
+    def add_new(page_entries: list[tuple[str, str, str]]) -> None:
+        available, _ = filter_sent_tracks_explained(chat_id, page_entries)
+        for entry in available:
+            video_id = parse_qs(urlsplit(entry[0]).query)["v"][0]
+            key = entry[2]
+            if video_id in seen_ids or (key and key in seen_keys):
+                continue
+            seen_ids.add(video_id)
+            if key:
+                seen_keys.add(key)
+            chosen.append(entry)
+            if len(chosen) >= AUTO_PLAYLIST_DOWNLOAD_LIMIT:
+                break
+
+    add_new(entries)
+    while len(chosen) < AUTO_PLAYLIST_DOWNLOAD_LIMIT and has_more and start <= AUTO_PLAYLIST_SCAN_LIMIT:
+        _, page_entries, has_more = await asyncio.to_thread(list_playlist, job["url"], start)
+        add_new(page_entries)
+        start += PLAYLIST_LIMIT
+    return chosen, min(start - 1, AUTO_PLAYLIST_SCAN_LIMIT)
 
 
 def quality_markup(job_id: str, media_type: str, *, mix: bool = False) -> InlineKeyboardMarkup:
@@ -763,6 +805,35 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     job = jobs.get(job_id)
     if job is None:
         await query.answer("Список устарел. Пришлите ссылку снова.", show_alert=True)
+        return
+    if job.get("auto_loading"):
+        await query.answer("Поиск новых песен уже идёт.")
+        return
+
+    if action == "auto":
+        job["auto_loading"] = True
+        try:
+            await query.answer("Ищу новые песни…")
+            await query.edit_message_text("Проверяю Mix и ищу новые песни…")
+            selected_entries, checked = await collect_auto_playlist(job)
+        except (DownloadError, ValueError, OSError, sqlite3.Error) as exc:
+            LOG.warning("Could not collect new playlist tracks: %s", exc)
+            job["auto_notice"] = "Не удалось проверить весь Mix. Попробуйте ещё раз."
+            await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job))
+            return
+        finally:
+            job["auto_loading"] = False
+        if not selected_entries:
+            job["auto_notice"] = f"Среди первых {checked} позиций новых песен нет."
+            await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job))
+            return
+        jobs.pop(job_id, None)
+        urls = [entry[0] for entry in selected_entries]
+        known_keys = {entry[0]: entry[2] for entry in selected_entries}
+        await deliver_media(
+            query, context, urls, "mp3", job["source_chat_id"], job["source_message_id"],
+            known_keys, job_id=job_id, quality=DEFAULT_QUALITY["mp3"],
+        )
         return
 
     if action == "why":
@@ -1529,7 +1600,7 @@ def main() -> None:
     ))
     app.add_handler(CallbackQueryHandler(
         select_playlist,
-        pattern=r"^mix:[a-f0-9]{12}:(?:toggle:\d+|page:\d+|select:(?:all|none)|remember:now|more:next|why:(?:show|back)|close:now|download:(?:mp3|mp4)|quality:(?:(?:mp3:(?:128|192|320))|(?:mp4:(?:360|480|720))|back))$",
+        pattern=r"^mix:[a-f0-9]{12}:(?:toggle:\d+|page:\d+|select:(?:all|none)|remember:now|more:next|why:(?:show|back)|close:now|auto:mp3|download:(?:mp3|mp4)|quality:(?:(?:mp3:(?:128|192|320))|(?:mp4:(?:360|480|720))|back))$",
     ))
     app.add_handler(CallbackQueryHandler(
         send_media,

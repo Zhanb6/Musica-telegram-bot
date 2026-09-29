@@ -105,7 +105,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(bot.load_retry_batch(job_id))
         self.assertIn(88, self.fake_bot.deleted)
         self.assertIn(99, self.fake_bot.deleted)
-        with sqlite3.connect(self.db) as connection:
+        with closing(sqlite3.connect(self.db)) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM sent_tracks").fetchone()[0], 2)
 
     async def test_cancel_before_sending_file(self):
@@ -312,6 +312,62 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["quality"], "480")
         with closing(sqlite3.connect(self.db)) as connection:
             self.assertIn("quality", [row[1] for row in connection.execute("PRAGMA table_info(retry_batches)")])
+
+    async def test_auto_mix_skips_saved_songs_and_downloads_next_thirty(self):
+        def entry(number):
+            return (
+                f"https://www.youtube.com/watch?v=video{number:06d}",
+                f"Artist - Song {number}", bot.song_key("Artist", f"Song {number}"),
+            )
+        for number in range(1, 31):
+            bot.record_sent_track(7, entry(number)[0], "Artist", f"Song {number}", self.db)
+        job_id = "444444444444"
+        job = {
+            "url": "https://www.youtube.com/playlist?list=RDvideo000001",
+            "title": "Mix", "entries": [entry(number) for number in range(1, 31)],
+            "selected": set(), "page": 0, "skipped": 0, "reasons": [],
+            "has_more": True, "next_start": 31, "source_chat_id": 7, "source_message_id": 88,
+        }
+        self.context.user_data["mixes"] = {job_id: job}
+        query = FakeQuery(f"mix:{job_id}:auto:mp3")
+        with patch.object(bot, "list_playlist", return_value=(
+            "Mix", [entry(number) for number in range(31, 61)], True,
+        )) as listing, patch.object(bot, "deliver_media", new_callable=AsyncMock) as deliver:
+            await bot.select_playlist(SimpleNamespace(callback_query=query), self.context)
+        listing.assert_called_once_with(job["url"], 31)
+        self.assertEqual(len(deliver.await_args.args[2]), 30)
+        self.assertEqual(deliver.await_args.args[2][0], entry(31)[0])
+        self.assertEqual(deliver.await_args.kwargs["quality"], "192")
+        self.assertNotIn(job_id, self.context.user_data["mixes"])
+
+    async def test_auto_mix_stops_after_150_inspected_positions(self):
+        job = {
+            "url": "https://www.youtube.com/playlist?list=RDvideo000001",
+            "entries": [], "next_start": 31, "has_more": True, "source_chat_id": 7,
+        }
+        with patch.object(bot, "list_playlist", return_value=("Mix", [], True)) as listing:
+            selected, checked = await bot.collect_auto_playlist(job)
+        self.assertEqual(selected, [])
+        self.assertEqual(checked, 150)
+        self.assertEqual([call.args[1] for call in listing.call_args_list], [31, 61, 91, 121])
+
+    async def test_auto_mix_with_no_new_songs_keeps_menu(self):
+        url = "https://www.youtube.com/watch?v=video000070"
+        bot.record_sent_track(7, url, "Artist", "Song", self.db)
+        job_id = "555555555555"
+        job = {
+            "url": "https://www.youtube.com/playlist?list=RDvideo000070",
+            "title": "Mix", "entries": [(url, "Artist - Song", bot.song_key("Artist", "Song"))],
+            "selected": set(), "page": 0, "skipped": 0, "reasons": [],
+            "has_more": False, "next_start": 31, "source_chat_id": 7, "source_message_id": 88,
+        }
+        self.context.user_data["mixes"] = {job_id: job}
+        query = FakeQuery(f"mix:{job_id}:auto:mp3")
+        with patch.object(bot, "deliver_media", new_callable=AsyncMock) as deliver:
+            await bot.select_playlist(SimpleNamespace(callback_query=query), self.context)
+        deliver.assert_not_awaited()
+        self.assertIn("новых песен нет", query.edits[-1][0])
+        self.assertIn(job_id, self.context.user_data["mixes"])
 
 
 if __name__ == "__main__":
