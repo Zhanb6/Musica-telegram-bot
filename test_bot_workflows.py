@@ -369,6 +369,85 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("новых песен нет", query.edits[-1][0])
         self.assertIn(job_id, self.context.user_data["mixes"])
 
+    async def test_youtube_search_keeps_video_results_and_duration(self):
+        options = []
+
+        class FakeYoutubeDL:
+            def __init__(self, settings):
+                options.append(settings)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return None
+            def extract_info(self, url, download):
+                self.query = url
+                self.download = download
+                return {"entries": [
+                    {"id": "video000071", "title": "Jace June - Come Home", "duration": 169},
+                    {"id": "invalid-id", "title": "Channel"},
+                ]}
+
+        with patch.object(bot, "YoutubeDL", FakeYoutubeDL):
+            results = bot.search_youtube("Jace June Come Home")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0], "https://www.youtube.com/watch?v=video000071")
+        self.assertEqual(results[0][3], 169)
+        self.assertTrue(options[0]["extract_flat"])
+
+    async def test_findout_result_goes_through_format_and_quality(self):
+        results = [(
+            "https://www.youtube.com/watch?v=video000072",
+            "Jace June - Come Home", bot.song_key("Jace June", "Come Home"), 169,
+        )]
+        edits = []
+        async def edit_text(text, **kwargs):
+            edits.append((text, kwargs.get("reply_markup")))
+        async def reply_text(text, **kwargs):
+            return SimpleNamespace(edit_text=edit_text)
+        message = SimpleNamespace(chat_id=7, message_id=88, reply_text=reply_text)
+        update = SimpleNamespace(
+            effective_message=message, effective_user=SimpleNamespace(id=42),
+        )
+        self.context.args = ["Jace", "June", "Come", "Home"]
+        with patch.object(bot, "search_youtube", return_value=results):
+            await bot.findout_command(update, self.context)
+        self.assertIn("[2:49]", edits[-1][1].inline_keyboard[0][0].text)
+        job_id = next(iter(self.context.user_data["youtube_searches"]))
+        pick = FakeQuery(f"find:{job_id}:0")
+        await bot.findout_action(SimpleNamespace(callback_query=pick), self.context)
+        self.assertIn("Теперь выберите формат", pick.edits[-1][0])
+        choose_format = FakeQuery(f"mp3:{job_id}")
+        await bot.send_media(SimpleNamespace(callback_query=choose_format), self.context)
+        choose_quality = FakeQuery(f"quality:{job_id}:mp3:192")
+        with patch.object(bot, "deliver_media", new_callable=AsyncMock) as deliver:
+            await bot.send_media(SimpleNamespace(callback_query=choose_quality), self.context)
+        self.assertEqual(deliver.await_args.args[2], [results[0][0]])
+        self.assertEqual(deliver.await_args.args[5], 88)
+        self.assertEqual(deliver.await_args.kwargs["quality"], "192")
+
+    async def test_findout_saved_result_cannot_download_again(self):
+        url = "https://www.youtube.com/watch?v=video000073"
+        bot.record_sent_track(7, url, "Artist", "Song", self.db)
+        job_id = "666666666666"
+        self.context.user_data["youtube_searches"] = {job_id: {
+            "entries": [(url, "Artist - Song", bot.song_key("Artist", "Song"), 180)],
+            "user_id": 42, "chat_id": 7, "source_message_id": 88,
+        }}
+        query = FakeQuery(f"find:{job_id}:0")
+        await bot.findout_action(SimpleNamespace(callback_query=query), self.context)
+        self.assertFalse(query.edits)
+        self.assertFalse(self.context.user_data.get("jobs"))
+
+    async def test_findout_close_removes_search_and_messages(self):
+        job_id = "777777777777"
+        self.context.user_data["youtube_searches"] = {job_id: {
+            "entries": [], "user_id": 42, "chat_id": 7, "source_message_id": 88,
+        }}
+        query = FakeQuery(f"find:{job_id}:close")
+        await bot.findout_action(SimpleNamespace(callback_query=query), self.context)
+        self.assertEqual(self.fake_bot.deleted, [88, 99])
+        self.assertNotIn(job_id, self.context.user_data["youtube_searches"])
+
 
 if __name__ == "__main__":
     unittest.main()

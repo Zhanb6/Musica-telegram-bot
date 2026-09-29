@@ -29,6 +29,7 @@ LOG = logging.getLogger(__name__)
 HISTORY_DB = Path(__file__).with_name("downloads.sqlite3")
 MAX_FILE_BYTES = 50_000_000  # Telegram Bot API upload limit
 MAX_BATCH = 10
+SEARCH_RESULT_LIMIT = 10
 PLAYLIST_LIMIT = 30
 AUTO_PLAYLIST_SCAN_LIMIT = 150
 AUTO_PLAYLIST_DOWNLOAD_LIMIT = 30
@@ -136,6 +137,37 @@ def list_playlist(url: str, start: int = 1) -> tuple[str, list[tuple[str, str, s
     if not entries and start == 1:
         raise ValueError("В этом миксе пока нет доступных треков.")
     return (info.get("title") or "YouTube Mix")[:100], entries, len(raw_entries) > PLAYLIST_LIMIT
+
+
+def search_youtube(query: str) -> list[tuple[str, str, str, int | None]]:
+    """Get video search results without downloading their media."""
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        "noplaylist": False,
+    }
+    with YoutubeDL(options) as downloader:
+        info = downloader.extract_info(f"ytsearch{SEARCH_RESULT_LIMIT}:{query}", download=False)
+    results = []
+    seen = set()
+    for entry in (info or {}).get("entries") or []:
+        if not entry or entry.get("is_live") or entry.get("live_status") in {"is_live", "is_upcoming"}:
+            continue
+        video_id = entry.get("id")
+        if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id) or video_id in seen:
+            continue
+        seen.add(video_id)
+        artist, title = music_metadata(entry)
+        duration = entry.get("duration")
+        results.append((
+            f"https://www.youtube.com/watch?v={video_id}",
+            str(entry.get("title") or title).replace("\n", " ").strip()[:150],
+            song_key(artist, title),
+            int(duration) if isinstance(duration, (int, float)) and duration >= 0 else None,
+        ))
+    return results
 
 
 def extract_urls(text: str) -> tuple[list[str], int]:
@@ -604,7 +636,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Я предложу скачать MP3 или MP4 и выбрать качество. "
         "Файл должен быть не больше 50 МБ. Во время загрузки можно нажать «Отменить», "
         "а неудачные ссылки повторить кнопкой. /artists — разделы музыки, /search — поиск, "
-        "/stats — статистика. "
+        "/stats — статистика, /findout запрос — поиск на YouTube. "
         "Ответьте /favorite на песню, чтобы добавить её в /favorites."
     )
 
@@ -994,6 +1026,9 @@ async def send_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if job is None:
                 await query.answer("Эта кнопка устарела. Пришлите ссылку снова.", show_alert=True)
                 return
+            if len(job) > 3 and job[3] != query.from_user.id:
+                await query.answer("Это чужой выбор.", show_alert=True)
+                return
             await query.answer()
             await query.edit_message_text(
                 f"Выберите качество {media_type.upper()}:",
@@ -1023,12 +1058,17 @@ async def send_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await query.answer("Неверное качество.", show_alert=True)
         return
 
-    job = context.user_data.setdefault("jobs", {}).pop(job_id, None)
+    jobs = context.user_data.setdefault("jobs", {})
+    job = jobs.get(job_id)
     if job is None:
         await query.answer("Эта кнопка уже использована. Пришлите ссылку снова.", show_alert=True)
         return
+    if len(job) > 3 and job[3] != query.from_user.id:
+        await query.answer("Это чужой выбор.", show_alert=True)
+        return
+    jobs.pop(job_id)
     await query.answer()
-    urls, source_chat_id, source_message_id = job
+    urls, source_chat_id, source_message_id = job[:3]
     await deliver_media(
         query, context, urls, media_type, source_chat_id, source_message_id,
         job_id=job_id, quality=quality,
@@ -1334,6 +1374,114 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         pass
 
 
+async def findout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    search_text = " ".join(context.args).strip()
+    if len(search_text) < 2 or len(search_text) > 150:
+        await message.reply_text(
+            "Напишите /findout и название песни, исполнителя или оба. Например: /findout Jace June Come Home",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖️ Закрыть", callback_data=f"searchclose:{update.effective_user.id}"),
+            ]]),
+        )
+        try:
+            await message.delete()
+        except TelegramError:
+            pass
+        return
+    status = await message.reply_text("Ищу на YouTube…")
+    search_failed = False
+    try:
+        results = await asyncio.to_thread(search_youtube, search_text)
+    except (DownloadError, ValueError, OSError) as exc:
+        LOG.warning("Could not search YouTube: %s", exc)
+        results, search_failed = [], True
+    if not results:
+        await status.edit_text(
+            ("Не удалось выполнить поиск YouTube. Попробуйте ещё раз." if search_failed else
+             "По этому запросу ничего не нашлось. Попробуйте указать исполнителя и название вместе."),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖️ Закрыть", callback_data=f"searchclose:{update.effective_user.id}"),
+            ]]),
+        )
+        try:
+            await message.delete()
+        except TelegramError:
+            pass
+        return
+    try:
+        video_ids, song_keys = sent_tracks(message.chat_id)
+    except (sqlite3.Error, OSError) as exc:
+        LOG.warning("Could not check found tracks against history: %s", exc)
+        video_ids, song_keys = set(), set()
+    searches = context.user_data.setdefault("youtube_searches", {})
+    if len(searches) >= 10:
+        searches.pop(next(iter(searches)))
+    job_id = uuid4().hex[:12]
+    searches[job_id] = {
+        "entries": results,
+        "user_id": update.effective_user.id,
+        "chat_id": message.chat_id,
+        "source_message_id": message.message_id,
+    }
+    rows = []
+    for index, (url, label, key, duration) in enumerate(results):
+        video_id = parse_qs(urlsplit(url).query)["v"][0]
+        saved = video_id in video_ids or bool(key and key in song_keys)
+        mark = "✅" if saved else "🎵"
+        time_label = f" [{duration // 60}:{duration % 60:02d}]" if duration is not None else ""
+        rows.append([InlineKeyboardButton(
+            f"{mark} {index + 1}. {label[:42]}{time_label}",
+            callback_data=f"find:{job_id}:{index}",
+        )])
+    rows.append([InlineKeyboardButton("✖️ Закрыть", callback_data=f"find:{job_id}:close")])
+    await status.edit_text(
+        f"🔎 YouTube: {search_text}\nВыберите запись. ✅ — песня уже есть в чате.",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def findout_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, job_id, choice = query.data.split(":", 2)
+    searches = context.user_data.setdefault("youtube_searches", {})
+    job = searches.get(job_id)
+    if job is None or job["chat_id"] != query.message.chat_id:
+        await query.answer("Поиск устарел. Отправьте /findout ещё раз.", show_alert=True)
+        return
+    if job["user_id"] != query.from_user.id:
+        await query.answer("Это чужой поиск.", show_alert=True)
+        return
+    if choice == "close":
+        searches.pop(job_id, None)
+        await query.answer()
+        await delete_batch_messages(context, job["chat_id"], job["source_message_id"], query.message.message_id)
+        return
+    index = int(choice)
+    if index >= len(job["entries"]):
+        await query.answer("Выберите запись заново.", show_alert=True)
+        return
+    url, label, key, _ = job["entries"][index]
+    if already_sent(job["chat_id"], url, key):
+        await query.answer("Эта песня уже есть в чате.", show_alert=True)
+        return
+    jobs = context.user_data.setdefault("jobs", {})
+    if len(jobs) >= 10:
+        jobs.pop(next(iter(jobs)))
+    jobs[job_id] = (
+        [url], job["chat_id"], job["source_message_id"], job["user_id"],
+    )
+    searches.pop(job_id, None)
+    await query.answer()
+    await query.edit_message_text(
+        f"Выбрано: {label}\nТеперь выберите формат:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎵 MP3", callback_data=f"mp3:{job_id}"),
+            InlineKeyboardButton("🎬 MP4", callback_data=f"mp4:{job_id}"),
+        ]]),
+    )
+
+
 def stats_view(chat_id: int, user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
     groups = library_groups(chat_id)
     groups.sort(key=lambda group: (-len(group[1]), group[0].casefold()))
@@ -1560,6 +1708,7 @@ async def configure_commands(app: Application) -> None:
             BotCommand("start", "Как пользоваться ботом"),
             BotCommand("artists", "Музыка по исполнителям"),
             BotCommand("search", "Найти песню или исполнителя"),
+            BotCommand("findout", "Найти песню на YouTube"),
             BotCommand("favorite", "Добавить песню в избранное (ответом)"),
             BotCommand("unfavorite", "Удалить песню из избранного (ответом)"),
             BotCommand("favorites", "Мои избранные песни"),
@@ -1586,12 +1735,14 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("artists", artists_command))
     app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("findout", findout_command))
     app.add_handler(CommandHandler(["favorite", "unfavorite"], change_favorite))
     app.add_handler(CommandHandler("favorites", favorites_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CallbackQueryHandler(close_search, pattern=r"^searchclose:\d+$"))
     app.add_handler(CallbackQueryHandler(favorites_action, pattern=r"^fav:\d+:(?:\d+|close)$"))
     app.add_handler(CallbackQueryHandler(stats_action, pattern=r"^stats:\d+:(?:\d+|close)$"))
+    app.add_handler(CallbackQueryHandler(findout_action, pattern=r"^find:[a-f0-9]{12}:(?:\d+|close)$"))
     app.add_handler(CallbackQueryHandler(cancel_download, pattern=r"^cancel:[a-f0-9]{12}$"))
     app.add_handler(CallbackQueryHandler(retry_download, pattern=r"^retry:[a-f0-9]{12}:(?:run|close)$"))
     app.add_handler(CallbackQueryHandler(
