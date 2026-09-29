@@ -1,0 +1,5 @@
+python-telegram-bot>=22,<23
+python-dotenv>=1,<2
+mutagen>=1.47,<2
+yt-dlp[default]>=2026.8.19
+yt-dlp-ejs

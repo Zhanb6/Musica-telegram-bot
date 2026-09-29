@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+bot.log
+bot.pid
+downloads.sqlite3*
+.DS_Store
+NOTES.md
+resort_existing.py
