@@ -5,6 +5,7 @@ __pycache__/
 bot.log
 bot.pid
 downloads.sqlite3*
+data/
 .DS_Store
 NOTES.md
 resort_existing.py
