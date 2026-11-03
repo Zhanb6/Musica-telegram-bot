@@ -25,6 +25,8 @@ from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TIT2, TPE1
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+from telethon import TelegramClient, events, types
+from telethon.errors import RPCError
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
@@ -42,6 +44,8 @@ PLAYLIST_PAGE_SIZE = 8
 MAX_PLAYLIST_SELECTION = 150
 ARTIST_TOPIC_THRESHOLD = 5
 MISC_TOPIC_NAME = "NoName"
+FAVORITES_TOPIC_KEY = "__favorites__"
+FAVORITES_TOPIC_NAME = "Избранные"
 TRANSIENT_REPLY_SECONDS = 20
 ZIP_SUCCESS_STATUS_SECONDS = 20
 ZIP_ERROR_STATUS_SECONDS = 120
@@ -357,6 +361,17 @@ def history_connection(db_path: Path = HISTORY_DB) -> sqlite3.Connection:
         "chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, due_at REAL NOT NULL, "
         "active INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (chat_id, message_id))"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS favorite_copies ("
+        "chat_id INTEGER NOT NULL, source_message_id INTEGER NOT NULL, "
+        "favorite_message_id INTEGER NOT NULL, pending_delete INTEGER NOT NULL DEFAULT 0, "
+        "artist TEXT, title TEXT, "
+        "PRIMARY KEY (chat_id, source_message_id))"
+    )
+    favorite_columns = {row[1] for row in connection.execute("PRAGMA table_info(favorite_copies)")}
+    for name in ("artist", "title"):
+        if name not in favorite_columns:
+            connection.execute(f"ALTER TABLE favorite_copies ADD COLUMN {name} TEXT")
     columns = {row[1] for row in connection.execute("PRAGMA table_info(sent_tracks)")}
     for name in ("artist", "title", "audio_file_id", "video_file_id"):
         if name not in columns:
@@ -514,6 +529,235 @@ def set_favorite(chat_id: int, message_id: int, enabled: bool, db_path: Path = H
     return bool(changed)
 
 
+def favorite_lock(app: Application, chat_id: int) -> asyncio.Lock:
+    locks = app.bot_data.setdefault("favorite_locks", {})
+    return locks.setdefault(chat_id, asyncio.Lock())
+
+
+def favorite_topic_id(chat_id: int) -> int | None:
+    with closing(history_connection()) as connection:
+        row = connection.execute(
+            "SELECT message_thread_id FROM artist_topics WHERE chat_id=? AND artist_key=?",
+            (chat_id, FAVORITES_TOPIC_KEY),
+        ).fetchone()
+    return row[0] if row else None
+
+
+async def ensure_favorite_topic(app: Application, chat_id: int) -> int:
+    thread_id = favorite_topic_id(chat_id)
+    if thread_id is not None:
+        return thread_id
+    topic = await app.bot.create_forum_topic(chat_id=chat_id, name=FAVORITES_TOPIC_NAME)
+    thread_id = topic.message_thread_id
+    with closing(history_connection()) as connection:
+        with connection:
+            connection.execute(
+                "INSERT INTO artist_topics (chat_id, artist_key, message_thread_id) VALUES (?, ?, ?)",
+                (chat_id, FAVORITES_TOPIC_KEY, thread_id),
+            )
+    return thread_id
+
+
+async def delete_favorite_copy(app: Application, chat_id: int, source_id: int, copy_id: int) -> None:
+    for attempt in range(3):
+        try:
+            client = app.bot_data.get("reaction_client")
+            if client is not None:
+                try:
+                    await client.delete_messages(chat_id, [copy_id], revoke=True)
+                except (RPCError, OSError, ValueError) as exc:
+                    LOG.warning("MTProto removal of favorite copy %s failed: %s", copy_id, exc)
+                    await app.bot.delete_message(chat_id=chat_id, message_id=copy_id)
+            else:
+                await app.bot.delete_message(chat_id=chat_id, message_id=copy_id)
+        except RetryAfter as exc:
+            wait = exc.retry_after
+            await asyncio.sleep(wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait))
+        except NetworkError:
+            await asyncio.sleep(2 ** attempt)
+        except BadRequest as exc:
+            if "not found" not in str(exc).casefold():
+                LOG.warning("Could not remove favorite copy %s: %s", copy_id, exc)
+                return
+            break
+        except TelegramError as exc:
+            LOG.warning("Could not remove favorite copy %s: %s", copy_id, exc)
+            return
+        else:
+            break
+    else:
+        LOG.warning("Favorite copy %s will be removed after retry", copy_id)
+        return
+    with closing(history_connection()) as connection:
+        with connection:
+            connection.execute(
+                "DELETE FROM favorite_copies WHERE chat_id=? AND source_message_id=? "
+                "AND favorite_message_id=? AND pending_delete=1",
+                (chat_id, source_id, copy_id),
+            )
+
+
+async def retry_pending_favorite_deletions(app: Application) -> None:
+    with closing(history_connection()) as connection:
+        rows = connection.execute(
+            "SELECT chat_id, source_message_id, favorite_message_id FROM favorite_copies "
+            "WHERE pending_delete=1"
+        ).fetchall()
+    for chat_id, source_id, copy_id in rows:
+        async with favorite_lock(app, chat_id):
+            with closing(history_connection()) as connection:
+                pending = connection.execute(
+                    "SELECT pending_delete FROM favorite_copies WHERE chat_id=? AND source_message_id=? "
+                    "AND favorite_message_id=?",
+                    (chat_id, source_id, copy_id),
+                ).fetchone()
+            if pending and pending[0]:
+                await delete_favorite_copy(app, chat_id, source_id, copy_id)
+
+
+async def favorite_source_details(app: Application, chat_id: int, source_id: int, row):
+    if row and row[0]:
+        return row[1], row[2], row[3]
+    client = app.bot_data.get("reaction_client")
+    if client is None:
+        return None
+    try:
+        message = await client.get_messages(chat_id, ids=source_id)
+    except (RPCError, OSError, ValueError) as exc:
+        LOG.warning("Could not inspect reacted message %s: %s", source_id, exc)
+        return None
+    if message is None or not message.audio:
+        return None
+    thread_id = getattr(getattr(message, "reply_to", None), "reply_to_top_id", None)
+    return (
+        thread_id,
+        getattr(message.file, "performer", None) or "Без исполнителя",
+        getattr(message.file, "title", None) or getattr(message.file, "name", None) or "Без названия",
+    )
+
+
+async def sync_favorite_copy(app: Application, chat_id: int, source_id: int, enabled: bool) -> bool:
+    """Keep a bot audio message and its favorite-topic copy in sync."""
+    async with favorite_lock(app, chat_id):
+        with closing(history_connection()) as connection:
+            source = connection.execute(
+                "SELECT audio_file_id, message_thread_id, artist, title FROM sent_tracks "
+                "WHERE chat_id=? AND message_id=?",
+                (chat_id, source_id),
+            ).fetchone()
+            copy = connection.execute(
+                "SELECT favorite_message_id, pending_delete FROM favorite_copies "
+                "WHERE chat_id=? AND source_message_id=?",
+                (chat_id, source_id),
+            ).fetchone()
+            is_favorite_copy = connection.execute(
+                "SELECT 1 FROM favorite_copies WHERE chat_id=? AND favorite_message_id=? LIMIT 1",
+                (chat_id, source_id),
+            ).fetchone()
+        if is_favorite_copy:
+            return False
+        if enabled:
+            if copy and copy[0] > 0:
+                with closing(history_connection()) as connection:
+                    with connection:
+                        connection.execute(
+                            "UPDATE sent_tracks SET favorite=1 WHERE chat_id=? AND message_id=?",
+                            (chat_id, source_id),
+                        )
+                        connection.execute(
+                            "UPDATE favorite_copies SET pending_delete=0 "
+                            "WHERE chat_id=? AND source_message_id=?",
+                            (chat_id, source_id),
+                        )
+                return True
+            details = await favorite_source_details(app, chat_id, source_id, source)
+            if details is None:
+                return False
+            source_thread, artist, title = details
+            thread_id = favorite_topic_id(chat_id)
+            if thread_id is not None and source_thread == thread_id:
+                return False
+            with closing(history_connection()) as connection:
+                with connection:
+                    connection.execute(
+                        "UPDATE sent_tracks SET favorite=1 WHERE chat_id=? AND message_id=?",
+                        (chat_id, source_id),
+                    )
+                    connection.execute(
+                        "INSERT INTO favorite_copies "
+                        "(chat_id, source_message_id, favorite_message_id, pending_delete, artist, title) "
+                        "VALUES (?, ?, 0, 0, ?, ?) ON CONFLICT(chat_id, source_message_id) "
+                        "DO UPDATE SET pending_delete=0, artist=excluded.artist, title=excluded.title",
+                        (chat_id, source_id, artist, title),
+                    )
+            thread_id = await ensure_favorite_topic(app, chat_id)
+            try:
+                copied = await app.bot.copy_message(
+                    chat_id=chat_id, from_chat_id=chat_id, message_id=source_id,
+                    message_thread_id=thread_id, disable_notification=True,
+                )
+            except TelegramError as exc:
+                LOG.warning("Could not copy favorite %s in chat %s: %s", source_id, chat_id, exc)
+                return True
+            with closing(history_connection()) as connection:
+                with connection:
+                    connection.execute(
+                        "UPDATE favorite_copies SET favorite_message_id=? "
+                        "WHERE chat_id=? AND source_message_id=? AND pending_delete=0",
+                        (copied.message_id, chat_id, source_id),
+                    )
+            return True
+        if not source and not copy:
+            return False
+        with closing(history_connection()) as connection:
+            with connection:
+                connection.execute(
+                    "UPDATE sent_tracks SET favorite=0 WHERE chat_id=? AND message_id=?",
+                    (chat_id, source_id),
+                )
+                connection.execute(
+                    "UPDATE favorite_copies SET pending_delete=1 "
+                    "WHERE chat_id=? AND source_message_id=?",
+                    (chat_id, source_id),
+                )
+                if copy and copy[0] == 0:
+                    connection.execute(
+                        "DELETE FROM favorite_copies WHERE chat_id=? AND source_message_id=?",
+                        (chat_id, source_id),
+                    )
+        if copy and copy[0] > 0:
+            await delete_favorite_copy(app, chat_id, source_id, copy[0])
+        return True
+
+
+async def backfill_favorite_topic(app: Application) -> None:
+    await retry_pending_favorite_deletions(app)
+    with closing(history_connection()) as connection:
+        rows = set(connection.execute(
+            "SELECT chat_id, message_id FROM sent_tracks "
+            "WHERE favorite=1 AND audio_file_id IS NOT NULL AND message_id IS NOT NULL"
+        ).fetchall())
+        rows.update(connection.execute(
+            "SELECT chat_id, source_message_id FROM favorite_copies "
+            "WHERE favorite_message_id=0 AND pending_delete=0"
+        ).fetchall())
+    for chat_id, source_id in rows:
+        try:
+            await sync_favorite_copy(app, chat_id, source_id, True)
+        except (sqlite3.Error, OSError, TelegramError) as exc:
+            LOG.warning("Could not restore favorite %s in chat %s: %s", source_id, chat_id, exc)
+        await asyncio.sleep(0.3)
+
+
+async def reconcile_favorite_topic(app: Application) -> None:
+    while True:
+        try:
+            await backfill_favorite_topic(app)
+        except (sqlite3.Error, OSError, TelegramError) as exc:
+            LOG.warning("Could not reconcile favorite topic: %s", exc)
+        await asyncio.sleep(60)
+
+
 def favorite_tracks(chat_id: int, db_path: Path = HISTORY_DB) -> list[tuple[str, str]]:
     with closing(history_connection(db_path)) as connection:
         rows = connection.execute(
@@ -521,10 +765,18 @@ def favorite_tracks(chat_id: int, db_path: Path = HISTORY_DB) -> list[tuple[str,
             "WHERE chat_id = ? AND favorite = 1 ORDER BY artist COLLATE NOCASE, title COLLATE NOCASE",
             (chat_id,),
         ).fetchall()
+        untracked = connection.execute(
+            "SELECT artist, title FROM favorite_copies AS copy "
+            "WHERE copy.chat_id=? AND copy.pending_delete=0 "
+            "AND NOT EXISTS (SELECT 1 FROM sent_tracks AS track "
+            "WHERE track.chat_id=copy.chat_id AND track.message_id=copy.source_message_id) "
+            "ORDER BY artist COLLATE NOCASE, title COLLATE NOCASE",
+            (chat_id,),
+        ).fetchall()
     return [
         (artist or key.partition("|")[0] or "Без исполнителя", title or key.partition("|")[2] or video_id)
         for artist, title, key, video_id in rows
-    ]
+    ] + [(artist or "Без исполнителя", title or "Без названия") for artist, title in untracked]
 
 
 async def artist_topic(
@@ -611,6 +863,11 @@ async def move_recent_misc_tracks(
                         "UPDATE sent_tracks SET message_id = ?, message_thread_id = ?, sent_at = CURRENT_TIMESTAMP "
                         "WHERE chat_id = ? AND video_id = ?",
                         (copied.message_id, artist_thread, chat_id, video_id),
+                    )
+                    connection.execute(
+                        "UPDATE favorite_copies SET source_message_id=? "
+                        "WHERE chat_id=? AND source_message_id=?",
+                        (copied.message_id, chat_id, old_message_id),
                     )
         except (TelegramError, sqlite3.Error, OSError) as exc:
             LOG.warning("Could not move track %s to artist topic: %s", video_id, exc)
@@ -3270,8 +3527,11 @@ async def change_favorite(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     enabled = message.text.split()[0].split("@", 1)[0] == "/favorite"
     try:
-        found = set_favorite(message.chat_id, reply.message_id, enabled)
-    except (sqlite3.Error, OSError) as exc:
+        if reply.audio:
+            found = await sync_favorite_copy(context.application, message.chat_id, reply.message_id, enabled)
+        else:
+            found = set_favorite(message.chat_id, reply.message_id, enabled)
+    except (sqlite3.Error, OSError, TelegramError) as exc:
         LOG.warning("Could not update favorite: %s", exc)
         await message.reply_text("Не удалось обновить избранное.")
         return
@@ -3451,6 +3711,74 @@ async def configure_commands(app: Application) -> None:
         LOG.warning("Could not update bot commands: %s", exc)
     resume_transient_cleanup(app.bot)
     asyncio.create_task(resume_pending_shared_syncs(app))
+    await start_reaction_listener(app)
+    app.bot_data["favorite_reconcile_task"] = asyncio.create_task(reconcile_favorite_topic(app))
+
+
+def has_heart(reactions: list) -> bool:
+    return any(
+        isinstance(reaction, types.ReactionEmoji) and reaction.emoticon.rstrip("\ufe0f") == "❤"
+        for reaction in reactions
+    )
+
+
+async def handle_reaction_event(app: Application, event: types.UpdateBotMessageReaction) -> None:
+    if not isinstance(event, types.UpdateBotMessageReaction):
+        return
+    if not isinstance(event.peer, types.PeerUser) or not isinstance(event.actor, types.PeerUser):
+        return
+    chat_id = event.peer.user_id
+    if event.actor.user_id != chat_id:
+        return
+    was_favorite = has_heart(event.old_reactions)
+    is_favorite = has_heart(event.new_reactions)
+    if was_favorite == is_favorite:
+        return
+    await sync_favorite_copy(app, chat_id, event.msg_id, is_favorite)
+
+
+async def start_reaction_listener(app: Application) -> None:
+    api_id = os.environ.get("TELEGRAM_API_ID")
+    api_hash = os.environ.get("TELEGRAM_API_HASH")
+    if not api_id or not api_hash:
+        LOG.info("Telegram API credentials not set; reaction favorites are disabled")
+        return
+    session_path = os.environ.get("TELEGA_BOT_SESSION_PATH") or str(HISTORY_DB.parent / "bot_reactions")
+    try:
+        client = TelegramClient(session_path, int(api_id), api_hash, catch_up=True)
+    except (ValueError, OSError) as exc:
+        LOG.warning("Invalid Telegram API configuration for reaction listener: %s", exc)
+        return
+
+    async def on_raw(event):
+        try:
+            await handle_reaction_event(app, event)
+        except (sqlite3.Error, OSError, TelegramError) as exc:
+            LOG.warning("Could not sync favorite reaction: %s", exc)
+
+    client.add_event_handler(on_raw, events.Raw)
+    app.bot_data["reaction_client"] = client
+    try:
+        await client.start(bot_token=os.environ["TELEGRAM_BOT_TOKEN"])
+    except Exception as exc:
+        LOG.warning("Could not start reaction listener: %s", exc)
+        app.bot_data.pop("reaction_client", None)
+        await client.disconnect()
+        return
+    LOG.info("Telegram reaction listener started")
+
+
+async def stop_reaction_listener(app: Application) -> None:
+    reconcile_task = app.bot_data.pop("favorite_reconcile_task", None)
+    if reconcile_task is not None:
+        reconcile_task.cancel()
+        try:
+            await reconcile_task
+        except asyncio.CancelledError:
+            pass
+    client = app.bot_data.pop("reaction_client", None)
+    if client is not None:
+        await client.disconnect()
 
 
 def main() -> None:
@@ -3466,7 +3794,10 @@ def main() -> None:
     with closing(history_connection()):
         pass
 
-    app = Application.builder().token(token).concurrent_updates(4).post_init(configure_commands).build()
+    app = (
+        Application.builder().token(token).concurrent_updates(4)
+        .post_init(configure_commands).post_shutdown(stop_reaction_listener).build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("artists", artists_command))
     app.add_handler(CommandHandler("renametopic", rename_topic_command))

@@ -25,6 +25,7 @@ class FakeBot:
         self.topics = []
         self.edits = []
         self.topic_edits = []
+        self.copies = []
         self.files = {}
         self.documents = []
         self.messages = []
@@ -67,6 +68,10 @@ class FakeBot:
         self.sent.append(kwargs)
         number = len(self.sent)
         return SimpleNamespace(message_id=100 + number, audio=SimpleNamespace(file_id=f"file-{number}"))
+
+    async def copy_message(self, **kwargs):
+        self.copies.append(kwargs)
+        return SimpleNamespace(message_id=600 + len(self.copies))
 
     async def delete_message(self, **kwargs):
         self.deleted.append(kwargs["message_id"])
@@ -743,7 +748,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_favorite_marks_existing_message_without_sending_audio(self):
         url = "https://www.youtube.com/watch?v=video000013"
-        bot.record_sent_track(7, url, "Hozier", "Too Sweet", self.db, message_id=123)
+        bot.record_sent_track(7, url, "Hozier", "Too Sweet", self.db, file_id="saved-audio", message_id=123)
         deleted = []
         async def delete():
             deleted.append(True)
@@ -755,11 +760,181 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await bot.change_favorite(SimpleNamespace(effective_message=message), self.context)
         self.assertEqual(bot.favorite_tracks(7, self.db), [("Hozier", "Too Sweet")])
         self.assertEqual(self.fake_bot.reactions[0]["reaction"], "❤️")
+        self.assertEqual(self.fake_bot.topics, [{"chat_id": 7, "name": "Избранные"}])
+        self.assertEqual(self.fake_bot.copies[0]["message_id"], 123)
         self.assertFalse(self.fake_bot.sent)
         self.assertTrue(deleted)
         message.text = "/unfavorite"
         await bot.change_favorite(SimpleNamespace(effective_message=message), self.context)
         self.assertEqual(bot.favorite_tracks(7, self.db), [])
+        self.assertIn(601, self.fake_bot.deleted)
+
+    async def test_heart_reaction_creates_one_copy_and_removes_it(self):
+        bot.record_sent_track(
+            7, "https://www.youtube.com/watch?v=video000023", "Miyagi", "Captain",
+            self.db, file_id="saved-audio", message_id=123, message_thread_id=400,
+        )
+        def reaction(actor, old, new, message_id=123):
+            return bot.types.UpdateBotMessageReaction(
+                peer=bot.types.PeerUser(7), msg_id=message_id, date=None,
+                actor=bot.types.PeerUser(actor), old_reactions=old,
+                new_reactions=new, qts=1,
+            )
+        heart = bot.types.ReactionEmoji("❤")  # Telegram omits the variation selector.
+        await bot.handle_reaction_event(self.context.application, reaction(7, [], [heart]))
+        await bot.handle_reaction_event(self.context.application, reaction(7, [], [heart]))
+        self.assertEqual(len(self.fake_bot.copies), 1)
+        self.assertEqual(self.fake_bot.copies[0]["message_thread_id"], 501)
+        self.assertEqual(bot.favorite_tracks(7, self.db), [("Miyagi", "Captain")])
+        await bot.handle_reaction_event(self.context.application, reaction(8, [heart], []))
+        await bot.handle_reaction_event(self.context.application, reaction(7, [], [bot.types.ReactionEmoji("👍")]))
+        self.assertEqual(bot.favorite_tracks(7, self.db), [("Miyagi", "Captain")])
+        await bot.handle_reaction_event(self.context.application, reaction(7, [heart], []))
+        self.assertEqual(bot.favorite_tracks(7, self.db), [])
+        self.assertEqual(self.fake_bot.deleted, [601])
+        with closing(bot.history_connection()) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM favorite_copies").fetchone()[0], 0)
+        await bot.handle_reaction_event(self.context.application, reaction(7, [], [heart], 999))
+        self.assertEqual(len(self.fake_bot.copies), 1)
+
+    async def test_heart_reaction_accepts_uncatalogued_bot_audio(self):
+        client = SimpleNamespace(
+            get_messages=AsyncMock(return_value=SimpleNamespace(
+                audio=SimpleNamespace(),
+                file=SimpleNamespace(performer="Ирина Кайратовна, Shiza", title="Kõk tu"),
+                reply_to=SimpleNamespace(reply_to_top_id=400),
+            )),
+            delete_messages=AsyncMock(),
+        )
+        self.context.application.bot_data["reaction_client"] = client
+        heart = bot.types.ReactionEmoji("❤")
+        def event(old, new):
+            return bot.types.UpdateBotMessageReaction(
+                peer=bot.types.PeerUser(7), msg_id=847, date=None,
+                actor=bot.types.PeerUser(7), old_reactions=old,
+                new_reactions=new, qts=1,
+            )
+        await bot.handle_reaction_event(self.context.application, event([], [heart]))
+        self.assertEqual(self.fake_bot.copies[0]["message_id"], 847)
+        self.assertEqual(bot.favorite_tracks(7, self.db), [("Ирина Кайратовна, Shiza", "Kõk tu")])
+        await bot.handle_reaction_event(self.context.application, event([heart], []))
+        client.delete_messages.assert_awaited_once_with(7, [601], revoke=True)
+        self.assertEqual(bot.favorite_tracks(7, self.db), [])
+
+    async def test_promoted_song_keeps_favorite_copy_mapping(self):
+        bot.record_sent_track(
+            7, "https://www.youtube.com/watch?v=video000028", "Miyagi", "Captain",
+            self.db, file_id="saved-audio", message_id=123, message_thread_id=400,
+        )
+        await bot.sync_favorite_copy(self.context.application, 7, 123, True)
+        await bot.move_recent_misc_tracks(self.context, 7, "Miyagi", 400, 502)
+        with closing(bot.history_connection()) as connection:
+            self.assertEqual(
+                connection.execute("SELECT message_id FROM sent_tracks WHERE chat_id=7").fetchone()[0], 602
+            )
+            self.assertEqual(
+                connection.execute("SELECT source_message_id FROM favorite_copies WHERE chat_id=7").fetchone()[0], 602
+            )
+        await bot.sync_favorite_copy(self.context.application, 7, 602, False)
+        self.assertEqual(bot.favorite_tracks(7, self.db), [])
+        self.assertIn(601, self.fake_bot.deleted)
+
+    async def test_favorite_removal_updates_flag_and_delete_intent_atomically(self):
+        bot.record_sent_track(
+            7, "https://www.youtube.com/watch?v=video000029", "Drake", "Headlines",
+            self.db, file_id="saved-audio", message_id=123,
+        )
+        await bot.sync_favorite_copy(self.context.application, 7, 123, True)
+        with closing(bot.history_connection()) as connection:
+            with connection:
+                connection.execute(
+                    "CREATE TRIGGER reject_favorite_delete BEFORE UPDATE OF pending_delete ON favorite_copies "
+                    "WHEN NEW.pending_delete=1 BEGIN SELECT RAISE(ABORT, 'test interruption'); END"
+                )
+        with self.assertRaises(sqlite3.IntegrityError):
+            await bot.sync_favorite_copy(self.context.application, 7, 123, False)
+        with closing(bot.history_connection()) as connection:
+            self.assertEqual(connection.execute("SELECT favorite FROM sent_tracks").fetchone()[0], 1)
+            self.assertEqual(connection.execute("SELECT pending_delete FROM favorite_copies").fetchone()[0], 0)
+            with connection:
+                connection.execute("DROP TRIGGER reject_favorite_delete")
+        await bot.sync_favorite_copy(self.context.application, 7, 123, False)
+        self.assertEqual(bot.favorite_tracks(7, self.db), [])
+
+    async def test_existing_favorite_is_restored_after_restart(self):
+        bot.record_sent_track(
+            7, "https://www.youtube.com/watch?v=video000024", "Drake", "One Dance",
+            self.db, file_id="saved-audio", message_id=234,
+        )
+        bot.set_favorite(7, 234, True, self.db)
+        await bot.backfill_favorite_topic(self.context.application)
+        await bot.backfill_favorite_topic(self.context.application)
+        self.assertEqual(len(self.fake_bot.copies), 1)
+        with closing(bot.history_connection()) as connection:
+            self.assertEqual(connection.execute("SELECT favorite_message_id FROM favorite_copies").fetchone()[0], 601)
+
+    async def test_favorite_copy_retries_after_temporary_copy_failure(self):
+        bot.record_sent_track(
+            7, "https://www.youtube.com/watch?v=video000025", "The Weeknd", "Starboy",
+            self.db, file_id="saved-audio", message_id=235,
+        )
+        original_copy = self.fake_bot.copy_message
+        self.fake_bot.copy_message = AsyncMock(side_effect=bot.NetworkError("temporary"))
+        self.assertTrue(await bot.sync_favorite_copy(self.context.application, 7, 235, True))
+        self.assertEqual(bot.favorite_tracks(7, self.db), [("The Weeknd", "Starboy")])
+        with closing(bot.history_connection()) as connection:
+            self.assertEqual(connection.execute("SELECT favorite_message_id FROM favorite_copies").fetchone()[0], 0)
+        self.fake_bot.copy_message = original_copy
+        await bot.backfill_favorite_topic(self.context.application)
+        self.assertEqual(len(self.fake_bot.copies), 1)
+
+    async def test_pending_favorite_deletion_recovers(self):
+        bot.record_sent_track(
+            7, "https://www.youtube.com/watch?v=video000026", "Drake", "Headlines",
+            self.db, file_id="saved-audio", message_id=236,
+        )
+        await bot.sync_favorite_copy(self.context.application, 7, 236, True)
+        original_delete = self.fake_bot.delete_message
+        self.fake_bot.delete_message = AsyncMock(side_effect=bot.NetworkError("temporary"))
+        with patch.object(bot.asyncio, "sleep", new=AsyncMock()):
+            await bot.sync_favorite_copy(self.context.application, 7, 236, False)
+        with closing(bot.history_connection()) as connection:
+            self.assertEqual(connection.execute("SELECT pending_delete FROM favorite_copies").fetchone()[0], 1)
+        self.fake_bot.delete_message = original_delete
+        await bot.retry_pending_favorite_deletions(self.context.application)
+        with closing(bot.history_connection()) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM favorite_copies").fetchone()[0], 0)
+        self.assertEqual(self.fake_bot.deleted, [601])
+
+    async def test_favorite_removal_uses_bot_mtproto_session(self):
+        bot.record_sent_track(
+            7, "https://www.youtube.com/watch?v=video000027", "Tame Impala", "Nangs",
+            self.db, file_id="saved-audio", message_id=237,
+        )
+        await bot.sync_favorite_copy(self.context.application, 7, 237, True)
+        client = SimpleNamespace(delete_messages=AsyncMock())
+        self.context.application.bot_data["reaction_client"] = client
+        await bot.sync_favorite_copy(self.context.application, 7, 237, False)
+        client.delete_messages.assert_awaited_once_with(7, [601], revoke=True)
+        self.assertEqual(self.fake_bot.deleted, [])
+        with closing(bot.history_connection()) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM favorite_copies").fetchone()[0], 0)
+
+    async def test_reaction_listener_uses_separate_bot_session(self):
+        fake_client = SimpleNamespace(
+            add_event_handler=unittest.mock.Mock(), start=AsyncMock(), disconnect=AsyncMock()
+        )
+        settings = {
+            "TELEGRAM_API_ID": "12345", "TELEGRAM_API_HASH": "a" * 32,
+            "TELEGRAM_BOT_TOKEN": "bot-token", "TELEGA_BOT_SESSION_PATH": "/tmp/test-bot-reactions",
+        }
+        with patch.dict(bot.os.environ, settings), patch.object(bot, "TelegramClient", return_value=fake_client) as client:
+            await bot.start_reaction_listener(self.context.application)
+        client.assert_called_once_with("/tmp/test-bot-reactions", 12345, "a" * 32, catch_up=True)
+        fake_client.start.assert_awaited_once_with(bot_token="bot-token")
+        self.assertIs(self.context.application.bot_data["reaction_client"], fake_client)
+        await bot.stop_reaction_listener(self.context.application)
+        fake_client.disconnect.assert_awaited_once()
 
     async def test_next_thirty_keeps_selection(self):
         def entries(start):
