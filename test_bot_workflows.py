@@ -153,6 +153,22 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             effective_chat=SimpleNamespace(id=chat_id, type="private"),
         )
 
+    def result_query(self, data):
+        query = FakeQuery(data)
+        parts = data.split(":")
+        store = "mixes" if parts[0] == "mix" else "youtube_searches"
+        job = self.context.user_data.get(store, {}).get(parts[1], {})
+        query.message.message_id = job.get("status_message_id", 99)
+        query.message.message_thread_id = job.get("thread_id")
+        index = None
+        if parts[2] in {"one", "toggle"}:
+            index = int(parts[3])
+        elif parts[2].isdigit():
+            index = int(parts[2])
+        if index is not None:
+            query.message.message_id = job.get("card_ids", {}).get(index, query.message.message_id)
+        return query
+
     async def test_navigation_start_submenu_back_and_cancel(self):
         self.context.args = []
         update = self.navigation_update("/start")
@@ -190,7 +206,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["entries"], [result])
         self.assertEqual(self.context.args, ["stale", "command", "args"])
         status = query.effective_message.reply_text.return_value
-        self.assertIn("1. Adele - Hello", status.edit_text.await_args.args[0])
+        self.assertEqual(self.fake_bot.messages[-2]["text"], "Adele - Hello\n⏱ 3:00")
 
     async def test_navigation_urls_work_in_every_mode_and_library_clears_input(self):
         urls = ("https://youtu.be/video000071", "https://www.youtube.com/playlist?list=PLtest")
@@ -1083,7 +1099,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "source_chat_id": 7, "source_message_id": 88,
         }
         self.context.user_data["mixes"] = {job_id: job}
-        query = FakeQuery(f"mix:{job_id}:more:next")
+        query = self.result_query(f"mix:{job_id}:more:next")
         with patch.object(bot, "list_playlist", return_value=("Mix", entries(31), False)) as listing:
             await bot.select_playlist(SimpleNamespace(callback_query=query), self.context)
         listing.assert_called_once_with(job["url"], 31)
@@ -1092,44 +1108,38 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["page"], 3)
         self.assertFalse(job["has_more"])
 
-    async def test_mix_link_shows_full_labels_and_keeps_page_numbers(self):
-        labels = [
-            f"Исполнитель с длинным именем {number} — Полное название композиции и приглашённые исполнители"
-            for number in range(9)
-        ]
+    async def test_mix_cards_keep_titles_with_own_download_buttons_and_clean_old_page(self):
+        labels = [f"Исполнитель {number} — Полное название композиции и приглашённые исполнители"
+                  for number in range(9)]
         entries = [(f"https://www.youtube.com/watch?v=video{n:06d}", label, "")
                    for n, label in enumerate(labels)]
-        edits = []
-
-        async def edit_text(text, **kwargs):
-            self.assertTrue(kwargs.get("disable_web_page_preview"))
-            edits.append((text, kwargs["reply_markup"]))
-
-        message = SimpleNamespace(
-            chat_id=7, message_id=88, text="https://www.youtube.com/playlist?list=RDvideo000001",
-            reply_text=AsyncMock(return_value=SimpleNamespace(edit_text=edit_text)),
-        )
+        update = self.navigation_update("https://www.youtube.com/playlist?list=PLtest")
         with patch.object(bot, "list_playlist", return_value=("Mix", entries, False)):
-            await bot.receive_url(SimpleNamespace(effective_message=message), self.context)
-        for index, label in enumerate(labels[:8], 1):
-            self.assertIn(f"{index}. {label}", edits[-1][0])
-        self.assertNotIn(labels[8], edits[-1][0])
-        self.assertIn("по номеру", edits[-1][0])
-        self.assertEqual(edits[-1][1].inline_keyboard[0][0].text, "⬜ Выбрать №1")
-        job_id = next(iter(self.context.user_data["mixes"]))
-        toggle = FakeQuery(f"mix:{job_id}:toggle:0")
+            await bot.receive_url(update, self.context)
+        job_id, job = next(iter(self.context.user_data["mixes"].items()))
+        for index, card in enumerate(self.fake_bot.messages[:8]):
+            self.assertEqual(card["text"], labels[index])
+            self.assertEqual(card["reply_markup"].inline_keyboard[0][0].text, "⬇️ Скачать")
+            self.assertEqual(card["reply_markup"].inline_keyboard[0][0].callback_data,
+                             f"mix:{job_id}:one:{index}")
+            self.assertTrue(card["disable_web_page_preview"])
+        old_ids = set(job["card_ids"].values())
+        toggle = self.result_query(f"mix:{job_id}:toggle:0")
         await bot.select_playlist(SimpleNamespace(callback_query=toggle), self.context)
-        self.assertIn(labels[0], toggle.edits[-1][0])
-        self.assertTrue(toggle.edit_kwargs[-1]["disable_web_page_preview"])
-        self.assertEqual(toggle.edits[-1][1].inline_keyboard[0][0].text, "☑️ Выбран №1")
-        page = FakeQuery(f"mix:{job_id}:page:1")
+        self.assertEqual(job["selected"], {0})
+        updated = next(edit for edit in self.fake_bot.edits if edit["message_id"] == toggle.message.message_id)
+        self.assertEqual(updated["text"], labels[0])
+        self.assertEqual(updated["reply_markup"].inline_keyboard[1][0].text, "☑️ Выбрана")
+        page = self.result_query(f"mix:{job_id}:page:1")
         await bot.select_playlist(SimpleNamespace(callback_query=page), self.context)
-        self.assertIn(f"9. {labels[8]}", page.edits[-1][0])
-        self.assertNotIn(labels[0], page.edits[-1][0])
-        self.assertTrue(page.edit_kwargs[-1]["disable_web_page_preview"])
-        self.assertEqual(page.edits[-1][1].inline_keyboard[0][0].text, "⬜ Выбрать №9")
-        self.assertEqual(page.edits[-1][1].inline_keyboard[0][0].callback_data,
-                         f"mix:{job_id}:toggle:8")
+        self.assertTrue(old_ids.issubset(set(self.fake_bot.deleted)))
+        self.assertEqual(self.fake_bot.messages[-2]["text"], labels[8])
+        self.assertEqual(self.fake_bot.messages[-2]["reply_markup"].inline_keyboard[0][0].callback_data,
+                         f"mix:{job_id}:one:8")
+        self.assertEqual(set(job["card_ids"]), {8})
+        await bot.select_playlist(SimpleNamespace(callback_query=toggle), self.context)
+        self.assertEqual(job["selected"], {0})
+        self.assertIn("устарела", toggle.answers[-1][0][0])
 
     def test_track_lists_stay_within_telegram_limit_for_long_unicode_labels(self):
         entries = [(index, "🎵" * 5000) for index in range(10)]
@@ -1178,18 +1188,18 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     {"id": "video000071", "artist": "Adele", "title": "Hello"},
                 ]}
 
-        status = SimpleNamespace(edit_text=AsyncMock())
+        status = SimpleNamespace(message_id=99, edit_text=AsyncMock())
         message = SimpleNamespace(
             chat_id=7, message_id=88, text="https://www.youtube.com/playlist?list=PLtest",
             reply_text=AsyncMock(return_value=status),
         )
         with patch.object(bot, "YoutubeDL", FakeYoutubeDL):
-            await bot.receive_url(SimpleNamespace(effective_message=message), self.context)
+            await bot.receive_url(SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=42)), self.context)
         job_id = next(iter(self.context.user_data["mixes"]))
-        self.assertIn("1. Adele - Hello", status.edit_text.await_args.args[0])
-        await bot.select_playlist(SimpleNamespace(callback_query=FakeQuery(f"mix:{job_id}:toggle:0")),
+        self.assertEqual(self.fake_bot.messages[-2]["text"], "Adele - Hello")
+        await bot.select_playlist(SimpleNamespace(callback_query=self.result_query(f"mix:{job_id}:toggle:0")),
                                   self.context)
-        await bot.select_playlist(SimpleNamespace(callback_query=FakeQuery(f"mix:{job_id}:remember:now")),
+        await bot.select_playlist(SimpleNamespace(callback_query=self.result_query(f"mix:{job_id}:remember:now")),
                                   self.context)
         with closing(bot.history_connection()) as connection:
             row = connection.execute(
@@ -1339,10 +1349,10 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "source_chat_id": 7, "source_message_id": 88,
         }
         self.context.user_data["mixes"] = {job_id: job}
-        chooser = FakeQuery(f"mix:{job_id}:download:mp3")
+        chooser = self.result_query(f"mix:{job_id}:download:mp3")
         await bot.select_playlist(SimpleNamespace(callback_query=chooser), self.context)
         self.assertIn("320 кбит/с", [button.text for row in chooser.edits[-1][1].inline_keyboard for button in row])
-        downloader = FakeQuery(f"mix:{job_id}:quality:mp3:128")
+        downloader = self.result_query(f"mix:{job_id}:quality:mp3:128")
         with patch.object(bot, "deliver_media", new_callable=AsyncMock) as deliver:
             await bot.select_playlist(SimpleNamespace(callback_query=downloader), self.context)
             await asyncio.gather(*self.context.application.tasks)
@@ -1401,7 +1411,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "has_more": True, "next_start": 31, "source_chat_id": 7, "source_message_id": 88,
         }
         self.context.user_data["mixes"] = {job_id: job}
-        query = FakeQuery(f"mix:{job_id}:auto:mp3")
+        query = self.result_query(f"mix:{job_id}:auto:mp3")
         with patch.object(bot, "list_playlist", return_value=(
             "Mix", [entry(number) for number in range(31, 61)], True,
         )) as listing, patch.object(bot, "deliver_media", new_callable=AsyncMock) as deliver:
@@ -1435,7 +1445,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "has_more": False, "next_start": 31, "source_chat_id": 7, "source_message_id": 88,
         }
         self.context.user_data["mixes"] = {job_id: job}
-        query = FakeQuery(f"mix:{job_id}:auto:mp3")
+        query = self.result_query(f"mix:{job_id}:auto:mp3")
         with patch.object(bot, "deliver_media", new_callable=AsyncMock) as deliver:
             await bot.select_playlist(SimpleNamespace(callback_query=query), self.context)
         deliver.assert_not_awaited()
@@ -1486,18 +1496,16 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.context.args = ["Jace", "June", "Come", "Home"]
         with patch.object(bot, "search_youtube", return_value=results):
             await bot.findout_command(update, self.context)
-        self.assertIn("[2:49]", edits[-1][1].inline_keyboard[0][0].text)
-        self.assertIn(f"1. {label}", edits[-1][0])
-        self.assertIn("по номеру", edits[-1][0])
-        self.assertEqual(edits[-1][1].inline_keyboard[0][0].text, "⬜ Выбрать №1 [2:49]")
+        self.assertEqual(self.fake_bot.messages[-2]["text"], label + "\n⏱ 2:49")
+        self.assertEqual(self.fake_bot.messages[-2]["reply_markup"].inline_keyboard[0][0].text, "⬇️ Скачать")
         job_id = next(iter(self.context.user_data["youtube_searches"]))
-        pick = FakeQuery(f"find:{job_id}:0")
+        pick = self.result_query(f"find:{job_id}:0")
         await bot.findout_action(SimpleNamespace(callback_query=pick), self.context)
-        self.assertIn("выбрано 1", pick.edits[-1][0])
-        self.assertIn(f"1. {label}", pick.edits[-1][0])
-        self.assertTrue(pick.edit_kwargs[-1]["disable_web_page_preview"])
-        self.assertEqual(pick.edits[-1][1].inline_keyboard[0][0].text, "☑️ Выбран №1 [2:49]")
-        download_selected = FakeQuery(f"find:{job_id}:download")
+        updated = next(edit for edit in self.fake_bot.edits if edit["message_id"] == pick.message.message_id)
+        self.assertEqual(updated["text"], label + "\n⏱ 2:49")
+        self.assertTrue(updated["disable_web_page_preview"])
+        self.assertEqual(updated["reply_markup"].inline_keyboard[1][0].text, "☑️ Выбрана")
+        download_selected = self.result_query(f"find:{job_id}:download")
         await bot.findout_action(SimpleNamespace(callback_query=download_selected), self.context)
         self.assertIn("Теперь выберите формат", download_selected.edits[-1][0])
         choose_format = FakeQuery(f"mp3:{job_id}")
@@ -1509,6 +1517,239 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deliver.await_args.args[2], [results[0][0]])
         self.assertEqual(deliver.await_args.args[5], 88)
         self.assertEqual(deliver.await_args.kwargs["quality"], "192")
+
+    async def test_findout_card_download_is_exact_independent_and_excluded_from_batch(self):
+        results = [(f"https://www.youtube.com/watch?v=video{number:06d}", f"Artist — Full song {number}", "", 180)
+                   for number in (71, 72)]
+        self.context.args = ["Artist"]
+        with patch.object(bot, "search_youtube", return_value=results):
+            await bot.findout_command(self.navigation_update("/findout Artist"), self.context)
+        parent_id, parent = next(iter(self.context.user_data["youtube_searches"].items()))
+        first_card_id = parent["card_ids"][0]
+        second_card_id = parent["card_ids"][1]
+        for index, card in enumerate(self.fake_bot.messages[:2]):
+            self.assertEqual(card["text"], results[index][1] + "\n⏱ 3:00")
+            self.assertEqual(card["reply_markup"].inline_keyboard[0][0].callback_data,
+                             f"find:{parent_id}:one:{index}")
+        await bot.findout_action(SimpleNamespace(callback_query=self.result_query(f"find:{parent_id}:0")), self.context)
+        direct = self.result_query(f"find:{parent_id}:one:0")
+        await bot.findout_action(SimpleNamespace(callback_query=direct), self.context)
+        child_id = parent["detached"][0]
+        self.assertEqual(self.context.user_data["jobs"][child_id][0], [results[0][0]])
+        self.assertEqual(parent["selected"], set())
+        self.assertEqual(parent["card_ids"], {1: second_card_id})
+        self.assertNotIn(first_card_id, self.fake_bot.deleted)
+        self.assertEqual(direct.edits[-1][1].inline_keyboard[0][0].callback_data, f"mp3:{child_id}")
+        await bot.findout_action(SimpleNamespace(callback_query=direct), self.context)
+        self.assertEqual(len(self.context.user_data["jobs"]), 1)
+        await bot.findout_action(SimpleNamespace(callback_query=self.result_query(f"find:{parent_id}:1")), self.context)
+        await bot.findout_action(SimpleNamespace(callback_query=self.result_query(f"find:{parent_id}:download")), self.context)
+        self.assertEqual(self.context.user_data["jobs"][parent_id][0], [results[1][0]])
+        self.assertIn(second_card_id, self.fake_bot.deleted)
+        self.assertNotIn(first_card_id, self.fake_bot.deleted)
+        for data in (f"mp3:{child_id}", f"quality:{child_id}:mp3:192"):
+            query = FakeQuery(data)
+            query.message.message_id = first_card_id
+            with patch.object(bot, "deliver_media", new_callable=AsyncMock) as deliver:
+                await bot.send_media(SimpleNamespace(callback_query=query), self.context)
+                await asyncio.gather(*self.context.application.tasks)
+                if data.startswith("quality"):
+                    self.assertEqual(deliver.await_args.args[2], [results[0][0]])
+
+    async def test_mix_card_child_is_not_recreated_or_selected_on_page_refresh(self):
+        entries = [(f"https://www.youtube.com/watch?v=video{n:06d}", f"Artist - Song {n}", "") for n in range(9)]
+        with patch.object(bot, "list_playlist", return_value=("Mix", entries, False)):
+            await bot.receive_url(self.navigation_update("https://www.youtube.com/playlist?list=PLtest", thread_id=77), self.context)
+        job_id, job = next(iter(self.context.user_data["mixes"].items()))
+        direct = self.result_query(f"mix:{job_id}:one:0")
+        foreign = self.result_query(f"mix:{job_id}:one:0")
+        foreign.from_user.id = 43
+        await bot.select_playlist(SimpleNamespace(callback_query=foreign), self.context)
+        self.assertFalse(self.context.user_data.get("jobs"))
+        await bot.select_playlist(SimpleNamespace(callback_query=direct), self.context)
+        self.assertEqual(self.context.user_data["jobs"][job["detached"][0]][0], [entries[0][0]])
+        await bot.select_playlist(SimpleNamespace(callback_query=self.result_query(f"mix:{job_id}:select:all")), self.context)
+        self.assertNotIn(0, job["selected"])
+        for page in (1, 0):
+            await bot.select_playlist(SimpleNamespace(callback_query=self.result_query(f"mix:{job_id}:page:{page}")), self.context)
+        self.assertNotIn(0, job["card_ids"])
+        self.assertEqual(set(job["card_ids"]), set(range(1, 8)))
+        self.assertTrue(all(message["message_thread_id"] == 77 for message in self.fake_bot.messages))
+
+    async def test_findout_cards_close_expire_and_new_search_remove_all_old_cards(self):
+        results = [("https://www.youtube.com/watch?v=video000071", "Artist - Song", "", None)]
+        self.context.args = ["Artist"]
+        for action in ("close", "new", "expire"):
+            with self.subTest(action=action), patch.object(bot, "search_youtube", return_value=results):
+                await bot.findout_command(self.navigation_update("/findout Artist"), self.context)
+                job_id, job = next(iter(self.context.user_data["youtube_searches"].items()))
+                ids = set(job["card_ids"].values()) | {job["status_message_id"]}
+                old = self.result_query(f"find:{job_id}:one:0")
+                if action == "close":
+                    await bot.findout_action(SimpleNamespace(callback_query=self.result_query(f"find:{job_id}:close")), self.context)
+                elif action == "new":
+                    await bot.findout_command(self.navigation_update("/findout Artist"), self.context)
+                else:
+                    job["timer"].cancel()
+                    with patch.object(bot, "SEARCH_UI_TIMEOUT", 0):
+                        job["timer"] = asyncio.create_task(bot.expire_findout(self.context, job_id))
+                        await job["timer"]
+                self.assertTrue(ids.issubset(set(self.fake_bot.deleted)))
+                await bot.findout_action(SimpleNamespace(callback_query=old), self.context)
+                self.assertFalse(self.context.user_data.get("jobs"))
+                await bot.clear_findout_ui(self.context, (7, None))
+
+    async def test_findout_partial_card_send_failure_cleans_sent_ids_and_can_retry(self):
+        results = [(f"https://www.youtube.com/watch?v=video{n:06d}", f"Artist - Song {n}", "", None) for n in (71, 72)]
+        self.context.args = ["Artist"]
+        original_send = self.fake_bot.send_message
+        calls = 0
+
+        async def failing_send(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise bot.TelegramError("send failed")
+            return await original_send(**kwargs)
+
+        with patch.object(bot, "search_youtube", return_value=results):
+            with patch.object(self.fake_bot, "send_message", side_effect=failing_send):
+                await bot.findout_command(self.navigation_update("/findout Artist"), self.context)
+            self.assertIn(401, self.fake_bot.deleted)
+            self.assertEqual(self.context.user_data["youtube_searches"], {})
+            await bot.findout_command(self.navigation_update("/findout Artist"), self.context)
+        job = next(iter(self.context.user_data["youtube_searches"].values()))
+        self.assertEqual(len(job["card_ids"]), 2)
+
+    async def test_findout_unicode_cards_retry_rate_limit_and_saved_button_cannot_download(self):
+        label = "🎵" * 5000
+        url = "https://www.youtube.com/watch?v=video000071"
+        bot.record_sent_track(7, url, "Artist", "Song", self.db)
+        self.context.args = ["Artist"]
+        original_send = self.fake_bot.send_message
+        calls = 0
+
+        async def rate_limited_send(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise bot.RetryAfter(0)
+            return await original_send(**kwargs)
+
+        with patch.object(bot, "search_youtube", return_value=[(url, label, "", 180)]), \
+             patch.object(self.fake_bot, "send_message", side_effect=rate_limited_send):
+            await bot.findout_command(self.navigation_update("/findout Artist"), self.context)
+        card = self.fake_bot.messages[0]
+        self.assertLessEqual(len(card["text"].encode("utf-16-le")) // 2, 4000)
+        self.assertTrue(card["text"].endswith("…"))
+        self.assertEqual(card["reply_markup"].inline_keyboard[0][0].text, "✅ Уже есть в чате")
+        job_id = next(iter(self.context.user_data["youtube_searches"]))
+        await bot.findout_action(SimpleNamespace(callback_query=self.result_query(f"find:{job_id}:one:0")), self.context)
+        self.assertFalse(self.context.user_data.get("jobs"))
+
+    async def test_child_close_and_timeout_restore_same_parent_card_for_search_and_mix(self):
+        url = "https://www.youtube.com/watch?v=video000071"
+        for mix in (False, True):
+            for expire in (False, True):
+                with self.subTest(mix=mix, expire=expire):
+                    if mix:
+                        with patch.object(bot, "list_playlist", return_value=("Mix", [(url, "Artist - Song", "")], False)):
+                            await bot.receive_url(self.navigation_update("https://www.youtube.com/playlist?list=PLtest"), self.context)
+                        store, prefix, handler = "mixes", "mix", bot.select_playlist
+                    else:
+                        self.context.args = ["Artist"]
+                        with patch.object(bot, "search_youtube", return_value=[(url, "Artist - Song", "", 180)]):
+                            await bot.findout_command(self.navigation_update("/findout Artist"), self.context)
+                        store, prefix, handler = "youtube_searches", "find", bot.findout_action
+                    parent_id, parent = next(iter(self.context.user_data[store].items()))
+                    card_id = parent["card_ids"][0]
+                    await handler(SimpleNamespace(callback_query=self.result_query(f"{prefix}:{parent_id}:one:0")), self.context)
+                    child_id = parent["detached"][0]
+                    if expire:
+                        record = self.context.user_data["findout_format_timers"][child_id]
+                        record["task"].cancel()
+                        await asyncio.sleep(0)
+                        with patch.object(bot, "SEARCH_UI_TIMEOUT", 0):
+                            record["task"] = asyncio.create_task(bot.expire_findout_format(self.context, child_id))
+                            await record["task"]
+                    else:
+                        close = FakeQuery(f"format:{child_id}:close")
+                        close.message.message_id = card_id
+                        await bot.send_media(SimpleNamespace(callback_query=close), self.context)
+                    self.assertEqual(parent["card_ids"][0], card_id)
+                    self.assertNotIn(card_id, self.fake_bot.deleted)
+                    self.assertNotIn(child_id, self.context.user_data["jobs"])
+                    self.assertNotIn(0, parent["detached"])
+                    restored = self.fake_bot.edits[-1]
+                    self.assertEqual(restored["message_id"], card_id)
+                    self.assertEqual(restored["reply_markup"].inline_keyboard[0][0].callback_data,
+                                     f"{prefix}:{parent_id}:one:0")
+                    await handler(SimpleNamespace(callback_query=self.result_query(f"{prefix}:{parent_id}:one:0")), self.context)
+                    child_id = parent["detached"][0]
+                    close_data = f"mix:{parent_id}:close:now" if mix else f"find:{parent_id}:close"
+                    await handler(SimpleNamespace(callback_query=self.result_query(close_data)), self.context)
+                    close = FakeQuery(f"format:{child_id}:close")
+                    close.message.message_id = card_id
+                    await bot.send_media(SimpleNamespace(callback_query=close), self.context)
+                    self.assertIn(card_id, self.fake_bot.deleted)
+
+    async def test_selection_edits_only_affected_card_before_footer_and_retries_rate_limits(self):
+        self.context.args = ["Artist"]
+        results = [(f"https://www.youtube.com/watch?v=video{n:06d}", f"Artist - Song {n}", "", None) for n in (71, 72)]
+        with patch.object(bot, "search_youtube", return_value=results):
+            await bot.findout_command(self.navigation_update("/findout Artist"), self.context)
+        job_id, job = next(iter(self.context.user_data["youtube_searches"].items()))
+        card_id, footer_id = job["card_ids"][0], job["status_message_id"]
+        original_edit = self.fake_bot.edit_message_text
+        attempts = []
+
+        async def limited_edit(**kwargs):
+            message_id = kwargs["message_id"]
+            attempts.append(message_id)
+            if attempts.count(message_id) == 1:
+                raise bot.RetryAfter(0)
+            return await original_edit(**kwargs)
+
+        with patch.object(self.fake_bot, "edit_message_text", side_effect=limited_edit):
+            await bot.findout_action(SimpleNamespace(callback_query=self.result_query(f"find:{job_id}:0")), self.context)
+        self.assertEqual(attempts, [card_id, card_id, footer_id, footer_id])
+        self.assertEqual(job["selected"], {0})
+        terminal = self.result_query(f"find:{job_id}:0")
+        with patch.object(self.fake_bot, "edit_message_text", side_effect=bot.RetryAfter(0)) as edit:
+            await bot.findout_action(SimpleNamespace(callback_query=terminal), self.context)
+        self.assertEqual(edit.await_count, 3)
+        self.assertEqual(job["selected"], {0})
+        self.assertIn("Не удалось изменить выбор", terminal.answers[-1][0][0])
+
+        async def failed_footer(**kwargs):
+            if kwargs["message_id"] == footer_id:
+                raise bot.RetryAfter(0)
+            return await original_edit(**kwargs)
+
+        terminal_footer = self.result_query(f"find:{job_id}:0")
+        with patch.object(self.fake_bot, "edit_message_text", side_effect=failed_footer):
+            await bot.findout_action(SimpleNamespace(callback_query=terminal_footer), self.context)
+        self.assertEqual(job["selected"], set())
+        self.assertEqual(self.fake_bot.edits[-1]["message_id"], card_id)
+        self.assertEqual(self.fake_bot.edits[-1]["reply_markup"].inline_keyboard[1][0].text, "⬜ Выбрать для пачки")
+        self.assertIn("счётчик пока не обновился", terminal_footer.answers[-1][0][0])
+
+    async def test_failed_mix_page_render_can_retry_same_page_without_extra_card_edits(self):
+        entries = [(f"https://www.youtube.com/watch?v=video{n:06d}", f"Artist - Song {n}", "") for n in range(9)]
+        with patch.object(bot, "list_playlist", return_value=("Mix", entries, False)):
+            await bot.receive_url(self.navigation_update("https://www.youtube.com/playlist?list=PLtest"), self.context)
+        job_id, job = next(iter(self.context.user_data["mixes"].items()))
+        page = self.result_query(f"mix:{job_id}:page:1")
+        with patch.object(self.fake_bot, "send_message", side_effect=bot.TelegramError("send failed")):
+            await bot.select_playlist(SimpleNamespace(callback_query=page), self.context)
+        self.assertEqual(job["page"], 1)
+        self.assertEqual(job["card_ids"], {})
+        self.assertIn("страницы ещё раз", page.answers[-1][0][0])
+        edit_count = len(self.fake_bot.edits)
+        await bot.select_playlist(SimpleNamespace(callback_query=self.result_query(f"mix:{job_id}:page:1")), self.context)
+        self.assertEqual(set(job["card_ids"]), {8})
+        self.assertEqual(self.fake_bot.messages[-2]["text"], entries[8][1])
+        self.assertEqual(len(self.fake_bot.edits), edit_count)
 
     async def test_findout_format_and_quality_can_be_closed_without_download(self):
         for open_quality in (False, True):
@@ -1622,7 +1863,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         }
         self.context.user_data["youtube_searches"] = {job_id: job}
         self.context.user_data["findout_current"] = {(7, None): job_id}
-        download = FakeQuery(f"find:{job_id}:download")
+        download = self.result_query(f"find:{job_id}:download")
 
         async def slow_edit(*args, **kwargs):
             await asyncio.sleep(0.03)
@@ -1664,7 +1905,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "entries": [(url, "Artist - Song", bot.song_key("Artist", "Song"), 180)],
             "user_id": 42, "chat_id": 7, "source_message_id": 88,
         }}
-        query = FakeQuery(f"find:{job_id}:0")
+        query = self.result_query(f"find:{job_id}:0")
         await bot.findout_action(SimpleNamespace(callback_query=query), self.context)
         self.assertFalse(query.edits)
         self.assertFalse(self.context.user_data.get("jobs"))
@@ -1674,7 +1915,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.context.user_data["youtube_searches"] = {job_id: {
             "entries": [], "user_id": 42, "chat_id": 7, "source_message_id": 88,
         }}
-        query = FakeQuery(f"find:{job_id}:close")
+        query = self.result_query(f"find:{job_id}:close")
         await bot.findout_action(SimpleNamespace(callback_query=query), self.context)
         self.assertEqual(self.fake_bot.deleted, [88, 99])
         self.assertNotIn(job_id, self.context.user_data["youtube_searches"])
@@ -1699,12 +1940,13 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.context.args = ["Artist", "Song"]
         with patch.object(bot, "search_youtube", return_value=results), patch.object(bot, "SEARCH_UI_TIMEOUT", 0.2):
             await bot.findout_command(update, self.context)
-            self.assertEqual(self.fake_bot.deleted, [88])
-            self.assertEqual(status_edits[-1][1].inline_keyboard[1][0].text, "✅ Уже есть №2 [2:01]")
+            self.assertEqual(self.fake_bot.deleted, [88, 99])
+            self.assertEqual(self.fake_bot.messages[1]["text"], "Artist - Song 1\n⏱ 2:01")
+            self.assertEqual(self.fake_bot.messages[1]["reply_markup"].inline_keyboard[0][0].text, "✅ Уже есть в чате")
             job_id = next(iter(self.context.user_data["youtube_searches"]))
 
             def choice(value, user_id=42, thread=77):
-                query = FakeQuery(f"find:{job_id}:{value}")
+                query = self.result_query(f"find:{job_id}:{value}")
                 query.from_user.id = user_id
                 query.message.message_thread_id = thread
                 return query
@@ -1726,16 +1968,18 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Выбрано записей: 2", download.edits[-1][0])
             self.assertEqual(self.context.user_data["jobs"][job_id][0], [results[0][0], results[2][0]])
             await asyncio.sleep(0.04)
-            self.assertNotIn(99, self.fake_bot.deleted)  # active format choice resets its own timer
+            self.assertNotIn(download.message.message_id, self.fake_bot.deleted)  # active format choice resets its own timer
             format_wrong_thread = FakeQuery(f"mp3:{job_id}")
             format_wrong_thread.message.message_thread_id = 78
             await bot.send_media(SimpleNamespace(callback_query=format_wrong_thread), self.context)
             self.assertIn("прежней теме", format_wrong_thread.answers[-1][0][0])
             choose_format = FakeQuery(f"mp3:{job_id}")
             choose_format.message.message_thread_id = 77
+            choose_format.message.message_id = download.message.message_id
             await bot.send_media(SimpleNamespace(callback_query=choose_format), self.context)
             choose_quality = FakeQuery(f"quality:{job_id}:mp3:192")
             choose_quality.message.message_thread_id = 77
+            choose_quality.message.message_id = download.message.message_id
             release = asyncio.Event()
 
             async def held_delivery(*args, **kwargs):
@@ -1754,7 +1998,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 await asyncio.gather(*self.context.application.tasks)
             await asyncio.sleep(0.22)
-            self.assertNotIn(99, self.fake_bot.deleted)  # timer cannot erase active download UI
+            self.assertNotIn(download.message.message_id, self.fake_bot.deleted)  # timer cannot erase active download UI
 
     async def test_abandoned_findout_format_screen_expires_and_cannot_download(self):
         entry = (
@@ -1772,10 +2016,10 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await bot.findout_command(update, self.context)
             job_id = next(iter(self.context.user_data["youtube_searches"]))
             await bot.findout_action(
-                SimpleNamespace(callback_query=FakeQuery(f"find:{job_id}:0")), self.context,
+                SimpleNamespace(callback_query=self.result_query(f"find:{job_id}:0")), self.context,
             )
             await bot.findout_action(
-                SimpleNamespace(callback_query=FakeQuery(f"find:{job_id}:download")), self.context,
+                SimpleNamespace(callback_query=self.result_query(f"find:{job_id}:download")), self.context,
             )
             await asyncio.sleep(0.04)
         self.assertIn(99, self.fake_bot.deleted)
@@ -1800,10 +2044,10 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             job_id = next(iter(self.context.user_data["youtube_searches"]))
             for index in (0, 1):
                 await bot.findout_action(
-                    SimpleNamespace(callback_query=FakeQuery(f"find:{job_id}:{index}")), self.context,
+                    SimpleNamespace(callback_query=self.result_query(f"find:{job_id}:{index}")), self.context,
                 )
             bot.record_sent_track(7, results[0][0], "Artist", "Song 0", file_id="already")
-            download = FakeQuery(f"find:{job_id}:download")
+            download = self.result_query(f"find:{job_id}:download")
             await bot.findout_action(SimpleNamespace(callback_query=download), self.context)
             self.assertIn("пропущено: 1", download.edits[-1][0])
             self.assertEqual(self.context.user_data["jobs"][job_id][0], [results[1][0]])
@@ -1844,9 +2088,9 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await bot.findout_command(update, self.context)
             job_id = next(iter(self.context.user_data["youtube_searches"]))
             await bot.findout_action(
-                SimpleNamespace(callback_query=FakeQuery(f"find:{job_id}:0")), self.context,
+                SimpleNamespace(callback_query=self.result_query(f"find:{job_id}:0")), self.context,
             )
-            download = FakeQuery(f"find:{job_id}:download")
+            download = self.result_query(f"find:{job_id}:download")
             download.edit_message_text = AsyncMock(side_effect=bot.TelegramError("edit failed"))
             await bot.findout_action(SimpleNamespace(callback_query=download), self.context)
             self.assertIn("Повторите кнопку", download.answers[-1][0][0])

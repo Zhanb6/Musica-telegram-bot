@@ -214,6 +214,210 @@ def track_list_text(header: str, entries: list[tuple[int, str]]) -> str:
     return "".join(lines)
 
 
+def track_card(job_id: str, job: dict, index: int, *, mix: bool = False):
+    entry = job["entries"][index]
+    text = entry[1]
+    if not mix and entry[3] is not None:
+        text += f"\n⏱ {entry[3] // 60}:{entry[3] % 60:02d}"
+    encoded = text.encode("utf-16-le")
+    if len(encoded) > 8000:
+        text = encoded[:7998].decode("utf-16-le", errors="ignore") + "…"
+    saved = already_sent(job["source_chat_id"] if mix else job["chat_id"], entry[0], entry[2])
+    prefix = f"mix:{job_id}:" if mix else f"find:{job_id}:"
+    rows = [[InlineKeyboardButton(
+        "✅ Уже есть в чате" if saved else "⬇️ Скачать", callback_data=f"{prefix}one:{index}",
+    )]]
+    if not saved:
+        rows.append([InlineKeyboardButton(
+            "☑️ Выбрана" if index in job["selected"] else "⬜ Выбрать для пачки",
+            callback_data=f"{prefix}toggle:{index}" if mix else f"{prefix}{index}",
+        )])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def clear_track_cards(context, job: dict) -> None:
+    ids = list(job.get("card_ids", {}).values())
+    job["card_ids"] = {}
+    job["cards_view"] = False
+    chat_id = job.get("chat_id", job.get("source_chat_id"))
+    for message_id in ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramError:
+            try:
+                await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+            except TelegramError:
+                pass
+
+
+async def retry_track_request(action):
+    for attempt in range(3):
+        try:
+            return await action()
+        except RetryAfter as exc:
+            if attempt == 2:
+                raise
+            delay = exc.retry_after
+            await asyncio.sleep(delay.total_seconds() if hasattr(delay, "total_seconds") else delay)
+
+
+async def send_track_message(context, **payload):
+    return await retry_track_request(lambda: context.bot.send_message(**payload))
+
+
+async def show_track_cards(context, job_id: str, job: dict, *, mix: bool = False) -> None:
+    await clear_track_cards(context, job)
+    job["card_ids"] = {}
+    chat_id = job.get("chat_id", job.get("source_chat_id"))
+    start = job["page"] * PLAYLIST_PAGE_SIZE if mix else 0
+    end = min(start + PLAYLIST_PAGE_SIZE, len(job["entries"])) if mix else len(job["entries"])
+    try:
+        for index in range(start, end):
+            if index in detached_track_indexes(context, job):
+                continue
+            text, markup = track_card(job_id, job, index, mix=mix)
+            sent = await send_track_message(
+                context, chat_id=chat_id, text=text, reply_markup=markup,
+                message_thread_id=job.get("thread_id"), disable_web_page_preview=True,
+            )
+            job["card_ids"][index] = sent.message_id
+        footer = await send_track_message(
+            context,
+            chat_id=chat_id, message_thread_id=job.get("thread_id"), disable_web_page_preview=True,
+            text=playlist_text(job) if mix else f"🔎 YouTube · выбрано {len(job['selected'])} записей.",
+            reply_markup=playlist_markup(job_id, job) if mix else findout_markup(job_id, job, set(), set()),
+        )
+        old_footer = job.get("status_message_id")
+        job["status_message_id"] = footer.message_id
+        job["cards_view"] = True
+        if old_footer is not None:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=old_footer)
+            except TelegramError:
+                pass
+    except TelegramError:
+        await clear_track_cards(context, job)
+        raise
+
+
+async def update_track_controls(
+    context, query, job_id: str, job: dict, *, mix: bool = False,
+    changed_indexes=(), previous_selected: set[int] | None = None,
+) -> None:
+    edited = []
+    try:
+        for index in changed_indexes:
+            message_id = job.get("card_ids", {}).get(index)
+            if message_id is None:
+                continue
+            card_text, card_markup = track_card(job_id, job, index, mix=mix)
+            try:
+                await retry_track_request(lambda: context.bot.edit_message_text(
+                    chat_id=query.message.chat_id, message_id=message_id, text=card_text,
+                    reply_markup=card_markup, disable_web_page_preview=True,
+                ))
+            except BadRequest as exc:
+                if "not modified" not in str(exc).lower():
+                    raise
+            edited.append(index)
+    except TelegramError:
+        if previous_selected is not None:
+            job["selected"] = previous_selected
+            for index in edited:
+                card_text, card_markup = track_card(job_id, job, index, mix=mix)
+                try:
+                    await retry_track_request(lambda: context.bot.edit_message_text(
+                        chat_id=query.message.chat_id, message_id=job["card_ids"][index], text=card_text,
+                        reply_markup=card_markup, disable_web_page_preview=True,
+                    ))
+                except TelegramError:
+                    pass
+        await query.answer("Не удалось изменить выбор. Попробуйте ещё раз.", show_alert=True)
+        return
+    text = playlist_text(job) if mix else f"🔎 YouTube · выбрано {len(job['selected'])} записей."
+    markup = playlist_markup(job_id, job) if mix else findout_markup(job_id, job, set(), set())
+    try:
+        if query.message.message_id == job.get("status_message_id", query.message.message_id):
+            await retry_track_request(lambda: query.edit_message_text(text, reply_markup=markup, disable_web_page_preview=True))
+        else:
+            await retry_track_request(lambda: context.bot.edit_message_text(
+                chat_id=query.message.chat_id, message_id=job["status_message_id"], text=text,
+                reply_markup=markup, disable_web_page_preview=True,
+            ))
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            await query.answer("Выбор сохранён в карточке, но счётчик пока не обновился.", show_alert=True)
+    except TelegramError:
+        await query.answer("Выбор сохранён в карточке, но счётчик пока не обновился.", show_alert=True)
+
+
+async def download_track_card(context, query, job_id: str, job: dict, index: int, *, mix: bool = False) -> None:
+    if job.get("card_ids", {}).get(index) != query.message.message_id:
+        await query.answer("Карточка устарела. Откройте список снова.", show_alert=True)
+        return
+    chat_id = job.get("chat_id", job.get("source_chat_id"))
+    url, _, key = job["entries"][index][:3]
+    if already_sent(chat_id, url, key):
+        await query.answer("Эта песня уже есть в чате.", show_alert=True)
+        return
+    child_id = uuid4().hex[:12]
+    try:
+        label = track_card(job_id, job, index, mix=mix)[0].encode("utf-16-le")[:7400].decode("utf-16-le", errors="ignore")
+        await query.edit_message_text(
+            label + "\n\nВыберите формат:",
+            reply_markup=format_markup(child_id, dismiss=True), disable_web_page_preview=True,
+        )
+    except TelegramError:
+        await query.answer("Не удалось открыть формат. Повторите кнопку.", show_alert=True)
+        return
+    context.user_data.setdefault("jobs", {})[child_id] = (
+        [url], chat_id, job["source_message_id"], job.get("user_id", query.from_user.id),
+        {url: key}, job.get("thread_id"),
+    )
+    context.user_data.setdefault("findout_format_timers", {})[child_id] = {
+        "chat_id": chat_id, "thread_id": job.get("thread_id"), "message_id": query.message.message_id,
+        "task": asyncio.create_task(expire_findout_format(context, child_id)),
+        "parent": ("mixes" if mix else "youtube_searches", job_id, url),
+    }
+    job["card_ids"].pop(index)
+    job.setdefault("detached", {})[index] = child_id
+    job["selected"].discard(index)
+    await query.answer()
+    await update_track_controls(context, query, job_id, job, mix=mix)
+
+
+async def restore_track_card(context, child_id: str, record: dict | None) -> bool:
+    if not record or "parent" not in record:
+        return False
+    store, parent_id, url = record["parent"]
+    parent = context.user_data.get(store, {}).get(parent_id)
+    if parent is None or not parent.get("cards_view"):
+        return False
+    index = next((i for i, entry in enumerate(parent["entries"])
+                  if entry[0] == url and parent.get("detached", {}).get(i) == child_id), None)
+    mix = store == "mixes"
+    if index is None or (mix and index // PLAYLIST_PAGE_SIZE != parent["page"]):
+        return False
+    text, markup = track_card(parent_id, parent, index, mix=mix)
+    await retry_track_request(lambda: context.bot.edit_message_text(
+        chat_id=record["chat_id"], message_id=record["message_id"], text=text,
+        reply_markup=markup, disable_web_page_preview=True,
+    ))
+    parent["card_ids"][index] = record["message_id"]
+    parent["detached"].pop(index, None)
+    return True
+
+
+def detached_track_indexes(context, job: dict) -> set[int]:
+    detached = job.setdefault("detached", {})
+    pending = context.user_data.setdefault("jobs", {})
+    active = context.application.bot_data.setdefault("active_batches", {})
+    for index, child_id in list(detached.items()):
+        if child_id not in pending and child_id not in active:
+            detached.pop(index)
+    return set(detached)
+
+
 def extract_urls(text: str) -> tuple[list[str], int]:
     """Read all distinct YouTube video links from one message."""
     urls = []
@@ -2199,11 +2403,6 @@ def playlist_markup(job_id: str, job: dict) -> InlineKeyboardMarkup:
     selected = job["selected"]
     start = page * PLAYLIST_PAGE_SIZE
     rows = []
-    for index in range(start, min(start + PLAYLIST_PAGE_SIZE, len(entries))):
-        label = "☑️ Выбран" if index in selected else "⬜ Выбрать"
-        rows.append([InlineKeyboardButton(
-            f"{label} №{index + 1}", callback_data=f"mix:{job_id}:toggle:{index}"
-        )])
     navigation = []
     if page > 0:
         navigation.append(InlineKeyboardButton("◀️", callback_data=f"mix:{job_id}:page:{page - 1}"))
@@ -2245,7 +2444,7 @@ def playlist_markup(job_id: str, job: dict) -> InlineKeyboardMarkup:
 
 def playlist_text(job: dict) -> str:
     instruction = (
-        "Выберите треки кнопками по номеру в списке, затем выберите формат." if job["entries"] else
+        "У каждой песни своя кнопка скачивания. Можно выбрать несколько песен для пачки." if job["entries"] else
         "Новых треков на этой странице нет. Посмотрите причины или откройте следующие 30."
     )
     text = (
@@ -2261,12 +2460,7 @@ def playlist_text(job: dict) -> str:
         text += "\nСледующую страницу пока не удалось получить. Попробуйте ещё раз."
     if job.get("auto_notice"):
         text += f"\n{job['auto_notice']}"
-    start = job.get("page", 0) * PLAYLIST_PAGE_SIZE
-    return track_list_text(text, [
-        (index, entry[1]) for index, entry in enumerate(
-            job["entries"][start:start + PLAYLIST_PAGE_SIZE], start,
-        )
-    ])
+    return text
 
 
 async def collect_auto_playlist(job: dict) -> tuple[list[tuple[str, str, str]], int]:
@@ -2284,6 +2478,8 @@ async def collect_auto_playlist(job: dict) -> tuple[list[tuple[str, str, str]], 
     def add_new(page_entries: list[tuple[str, str, str]]) -> None:
         available, _ = filter_sent_tracks_explained(chat_id, page_entries)
         for entry in available:
+            if entry[0] in job.get("active_child_urls", set()):
+                continue
             video_id = parse_qs(urlsplit(entry[0]).query)["v"][0]
             key = entry[2]
             if video_id in seen_ids or (key and key in seen_keys):
@@ -2340,9 +2536,26 @@ def hidden_reasons_text(job: dict) -> str:
 
 async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
+    key = (message.chat_id, getattr(message, "message_thread_id", None))
+    lock = context.user_data.setdefault("search_panel_locks", {}).setdefault(key, asyncio.Lock())
+    async with lock:
+        await receive_url_impl(update, context)
+
+
+async def receive_url_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
     raw_urls = [raw.rstrip(".,!?;:)]}") for raw in URL.findall(message.text or "")]
     playlist_urls = [url for raw in raw_urls if (url := normalize_playlist_url(raw))]
     if len(raw_urls) == 1 and playlist_urls:
+        for old_id, old in list(context.user_data.setdefault("mixes", {}).items()):
+            if (old["source_chat_id"], old.get("thread_id")) == (message.chat_id, getattr(message, "message_thread_id", None)):
+                context.user_data["mixes"].pop(old_id, None)
+                await clear_track_cards(context, old)
+                if old.get("status_message_id"):
+                    try:
+                        await context.bot.delete_message(chat_id=message.chat_id, message_id=old["status_message_id"])
+                    except TelegramError:
+                        pass
         status = await message.reply_text("Получаю список треков…")
         try:
             title, entries, has_more = await asyncio.to_thread(list_playlist, playlist_urls[0])
@@ -2356,7 +2569,7 @@ async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         jobs = context.user_data.setdefault("mixes", {})
         if len(jobs) >= 10:
-            jobs.pop(next(iter(jobs)))
+            await clear_track_cards(context, jobs.pop(next(iter(jobs))))
         job_id = uuid4().hex[:12]
         job = {
             "title": title,
@@ -2370,9 +2583,18 @@ async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "next_start": 1 + PLAYLIST_LIMIT,
             "source_chat_id": message.chat_id,
             "source_message_id": message.message_id,
+            "user_id": update.effective_user.id,
+            "thread_id": getattr(message, "message_thread_id", None),
+            "status_message_id": status.message_id,
         }
         jobs[job_id] = job
-        await status.edit_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
+        try:
+            await status.edit_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
+            await show_track_cards(context, job_id, job, mix=True)
+        except TelegramError:
+            jobs.pop(job_id, None)
+            await clear_track_cards(context, job)
+            await status.edit_text("Не удалось показать треки. Пришлите ссылку ещё раз.")
         return
 
     urls, invalid = extract_urls(message.text or "")
@@ -2397,6 +2619,18 @@ async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.callback_query.message
+    key = (message.chat_id, getattr(message, "message_thread_id", None))
+    lock = context.user_data.setdefault("search_panel_locks", {}).setdefault(key, asyncio.Lock())
+    async with lock:
+        try:
+            await select_playlist_impl(update, context)
+        except TelegramError as exc:
+            LOG.warning("Could not show Mix cards: %s", exc)
+            await update.callback_query.answer("Не удалось показать треки. Нажмите кнопку страницы ещё раз.", show_alert=True)
+
+
+async def select_playlist_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     _, job_id, action, value = query.data.split(":", 3)
     jobs = context.user_data.setdefault("mixes", {})
@@ -2404,11 +2638,31 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if job is None:
         await query.answer("Список устарел. Пришлите ссылку снова.", show_alert=True)
         return
+    if (job["source_chat_id"] != query.message.chat_id
+            or job.get("user_id", query.from_user.id) != query.from_user.id
+            or job.get("thread_id") != getattr(query.message, "message_thread_id", None)):
+        await query.answer("Откройте свой список в прежней теме.", show_alert=True)
+        return
+    if action == "one":
+        await download_track_card(context, query, job_id, job, int(value), mix=True)
+        return
+    if (action != "toggle" and job.get("status_message_id") is not None
+            and job["status_message_id"] != query.message.message_id):
+        await query.answer("Меню устарело.", show_alert=True)
+        return
+    if action == "toggle" and "card_ids" in job and (
+            job["card_ids"].get(int(value)) != query.message.message_id
+            and job.get("status_message_id") != query.message.message_id):
+        await query.answer("Карточка устарела.", show_alert=True)
+        return
     if job.get("auto_loading"):
         await query.answer("Поиск новых песен уже идёт.")
         return
+    previous_selected = set(job["selected"])
 
     if action == "auto":
+        job["active_child_urls"] = {job["entries"][index][0] for index in detached_track_indexes(context, job)}
+        await clear_track_cards(context, job)
         job["auto_loading"] = True
         try:
             await query.answer("Ищу новые песни…")
@@ -2418,12 +2672,14 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             LOG.warning("Could not collect new playlist tracks: %s", exc)
             job["auto_notice"] = "Не удалось проверить весь Mix. Попробуйте ещё раз."
             await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
+            await show_track_cards(context, job_id, job, mix=True)
             return
         finally:
             job["auto_loading"] = False
         if not selected_entries:
             job["auto_notice"] = f"Среди первых {checked} позиций новых песен нет."
             await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
+            await show_track_cards(context, job_id, job, mix=True)
             return
         jobs.pop(job_id, None)
         urls = [entry[0] for entry in selected_entries]
@@ -2435,6 +2691,7 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if action == "why":
+        await clear_track_cards(context, job)
         await query.answer()
         if value == "show":
             await query.edit_message_text(
@@ -2444,9 +2701,11 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
         else:
             await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
+            await show_track_cards(context, job_id, job, mix=True)
         return
     if action == "close":
         jobs.pop(job_id, None)
+        await clear_track_cards(context, job)
         await query.answer()
         await delete_batch_messages(
             context, job["source_chat_id"], job["source_message_id"], query.message.message_id,
@@ -2455,6 +2714,9 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if action == "toggle":
         index = int(value)
+        if index in detached_track_indexes(context, job):
+            await query.answer("Для этой песни уже открыт выбор загрузки.", show_alert=True)
+            return
         if index >= len(job["entries"]):
             await query.answer()
             return
@@ -2470,12 +2732,15 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if page < 0 or page * PLAYLIST_PAGE_SIZE >= len(job["entries"]):
             await query.answer()
             return
-        if page == job["page"]:
+        expected = set(range(page * PLAYLIST_PAGE_SIZE, min((page + 1) * PLAYLIST_PAGE_SIZE, len(job["entries"]))))
+        expected -= detached_track_indexes(context, job)
+        if page == job["page"] and set(job.get("card_ids", {})) == expected:
             await query.answer()
             return
         job["page"] = page
     elif action == "select":
-        selected = set(range(min(len(job["entries"]), MAX_PLAYLIST_SELECTION))) if value == "all" else set()
+        selected = (set(range(min(len(job["entries"]), MAX_PLAYLIST_SELECTION))) - detached_track_indexes(context, job)
+                    if value == "all" else set())
         if selected == job["selected"]:
             await query.answer("Выбор уже установлен.")
             return
@@ -2523,6 +2788,7 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Сначала отметьте треки, которые уже есть в чате.", show_alert=True)
             return
         selected_entries = [job["entries"][index] for index in sorted(job["selected"])]
+        detached_urls = {job["entries"][index][0]: child_id for index, child_id in job.get("detached", {}).items()}
         try:
             for url, label, key in selected_entries:
                 artist, title = music_metadata({"title": label})
@@ -2533,19 +2799,24 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Не удалось сохранить список. Попробуйте снова.", show_alert=True)
             return
         job["reasons"].extend(reasons)
+        job["detached"] = {index: detached_urls[entry[0]] for index, entry in enumerate(job["entries"])
+                           if entry[0] in detached_urls}
         job["skipped"] = len(job["reasons"])
         job["selected"] = set()
         job["page"] = 0
         await query.answer(f"Запомнил треков: {len(selected_entries)}.")
         if not job["entries"] and not job["has_more"]:
             jobs.pop(job_id)
+            await clear_track_cards(context, job)
             await delete_batch_messages(
                 context, job["source_chat_id"], job["source_message_id"], query.message.message_id,
             )
             return
         await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
+        await show_track_cards(context, job_id, job, mix=True)
         return
     elif action == "download":
+        job["selected"].difference_update(detached_track_indexes(context, job))
         if not job["selected"]:
             await query.answer("Сначала выберите хотя бы один трек.", show_alert=True)
             return
@@ -2554,11 +2825,13 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"Выбрано треков: {len(job['selected'])}. Выберите качество {value.upper()}:",
             reply_markup=quality_markup(job_id, value, mix=True),
         )
+        await clear_track_cards(context, job)
         return
     elif action == "quality":
         if value == "back":
             await query.answer()
             await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
+            await show_track_cards(context, job_id, job, mix=True)
             return
         try:
             media_type, quality = value.split(":", 1)
@@ -2569,6 +2842,7 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Выберите треки и качество заново.", show_alert=True)
             return
         jobs.pop(job_id)
+        await clear_track_cards(context, job)
         await query.answer()
         selected_entries = [job["entries"][index] for index in sorted(job["selected"])]
         urls = [entry[0] for entry in selected_entries]
@@ -2579,7 +2853,13 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     await query.answer()
-    await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
+    if action in {"page", "more"}:
+        await show_track_cards(context, job_id, job, mix=True)
+        return
+    await update_track_controls(
+        context, query, job_id, job, mix=True,
+        changed_indexes=previous_selected ^ job["selected"], previous_selected=previous_selected,
+    )
 
 
 async def send_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2653,7 +2933,9 @@ async def send_media_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
             if parts[2] == "close":
                 try:
-                    await context.bot.delete_message(chat_id=job[1], message_id=query.message.message_id)
+                    record = context.user_data.setdefault("findout_format_timers", {}).get(job_id)
+                    if not await restore_track_card(context, job_id, record):
+                        await context.bot.delete_message(chat_id=job[1], message_id=query.message.message_id)
                 except TelegramError as exc:
                     LOG.warning("Could not close format selection: %s", exc)
                     await query.answer("Не удалось убрать сообщение. Попробуйте ещё раз.", show_alert=True)
@@ -3035,6 +3317,7 @@ async def clear_findout_ui(context, key: tuple[int, int | None]) -> None:
     old_job_id = context.user_data.setdefault("findout_current", {}).pop(key, None)
     old_job = context.user_data.setdefault("youtube_searches", {}).pop(old_job_id, None) if old_job_id else None
     if old_job:
+        await clear_track_cards(context, old_job)
         if old_job.get("timer"):
             old_job["timer"].cancel()
         try:
@@ -3289,7 +3572,10 @@ async def findout_command_impl(update: Update, context: ContextTypes.DEFAULT_TYP
         video_ids, song_keys = set(), set()
     searches = context.user_data.setdefault("youtube_searches", {})
     if len(searches) >= 10:
-        searches.pop(next(iter(searches)))
+        old = searches.pop(next(iter(searches)))
+        if old.get("timer"):
+            old["timer"].cancel()
+        await clear_track_cards(context, old)
     job_id = uuid4().hex[:12]
     searches[job_id] = {
         "entries": results,
@@ -3305,16 +3591,15 @@ async def findout_command_impl(update: Update, context: ContextTypes.DEFAULT_TYP
     current[key] = job_id
     try:
         await status.edit_text(
-            track_list_text(
-                f"🔎 YouTube: {search_text}\nОтметьте до 10 записей кнопками по номеру в списке. ✅ — уже есть в чате.",
-                [(index, entry[1]) for index, entry in enumerate(results)],
-            ),
+            f"🔎 YouTube: {search_text}\nСкачайте песню её кнопкой или выберите несколько для пачки.",
             reply_markup=findout_markup(job_id, searches[job_id], video_ids, song_keys),
             disable_web_page_preview=True,
         )
+        await show_track_cards(context, job_id, searches[job_id])
     except TelegramError as exc:
         LOG.warning("Could not show YouTube search results: %s", exc)
-        searches.pop(job_id, None)
+        failed = searches.pop(job_id, None)
+        await clear_track_cards(context, failed or {})
         current.pop(key, None)
         try:
             await context.bot.delete_message(chat_id=message.chat_id, message_id=status.message_id)
@@ -3332,14 +3617,6 @@ async def findout_command_impl(update: Update, context: ContextTypes.DEFAULT_TYP
 def findout_markup(job_id: str, job: dict, video_ids: set, song_keys: set) -> InlineKeyboardMarkup:
     rows = []
     selected = job.setdefault("selected", set())
-    for index, (url, _, key, duration) in enumerate(job["entries"]):
-        video_id = parse_qs(urlsplit(url).query)["v"][0]
-        saved = video_id in video_ids or bool(key and key in song_keys)
-        label = "✅ Уже есть" if saved else "☑️ Выбран" if index in selected else "⬜ Выбрать"
-        time_label = f" [{duration // 60}:{duration % 60:02d}]" if duration is not None else ""
-        rows.append([InlineKeyboardButton(
-            f"{label} №{index + 1}{time_label}", callback_data=f"find:{job_id}:{index}",
-        )])
     rows.append([InlineKeyboardButton(
         f"⬇️ Скачать выбранные ({len(selected)})", callback_data=f"find:{job_id}:download",
     )])
@@ -3363,6 +3640,7 @@ async def expire_findout(context, job_id: str) -> None:
         if not job or job.get("timer") is not asyncio.current_task():
             return
         searches.pop(job_id, None)
+        await clear_track_cards(context, job)
         if context.user_data.setdefault("findout_current", {}).get(key) == job_id:
             context.user_data["findout_current"].pop(key, None)
         try:
@@ -3418,7 +3696,8 @@ async def expire_findout_format(context, job_id: str) -> None:
         timers.pop(job_id, None)
         context.user_data.setdefault("jobs", {}).pop(job_id, None)
         try:
-            await context.bot.delete_message(chat_id=record["chat_id"], message_id=record["message_id"])
+            if not await restore_track_card(context, job_id, record):
+                await context.bot.delete_message(chat_id=record["chat_id"], message_id=record["message_id"])
         except TelegramError:
             pass
 
@@ -3445,8 +3724,24 @@ async def findout_action_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
     if job.get("thread_id") != getattr(query.message, "message_thread_id", None):
         await query.answer("Откройте поиск в прежней теме.", show_alert=True)
         return
+    if choice.startswith("one:"):
+        await download_track_card(context, query, job_id, job, int(choice.split(":", 1)[1]))
+        if job.get("timer"):
+            job["timer"].cancel()
+        job["timer"] = asyncio.create_task(expire_findout(context, job_id))
+        return
+    if (not choice.isdigit() and job.get("status_message_id") is not None
+            and job["status_message_id"] != query.message.message_id):
+        await query.answer("Меню устарело.", show_alert=True)
+        return
+    if choice.isdigit() and "card_ids" in job and (
+            job["card_ids"].get(int(choice)) != query.message.message_id
+            and job.get("status_message_id") != query.message.message_id):
+        await query.answer("Карточка устарела.", show_alert=True)
+        return
     if choice == "close":
         searches.pop(job_id, None)
+        await clear_track_cards(context, job)
         if job.get("timer"):
             job["timer"].cancel()
         context.user_data.setdefault("findout_current", {}).pop((job["chat_id"], job.get("thread_id")), None)
@@ -3460,7 +3755,7 @@ async def findout_action_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
             await delete_batch_messages(context, job["chat_id"], job["source_message_id"], query.message.message_id)
         return
     if choice == "download":
-        selected = sorted(job.setdefault("selected", set()))
+        selected = sorted(job.setdefault("selected", set()) - detached_track_indexes(context, job))
         if not selected:
             await query.answer("Сначала отметьте хотя бы одну запись.", show_alert=True)
             return
@@ -3496,6 +3791,7 @@ async def findout_action_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
             known_keys, job.get("thread_id"),
         )
         searches.pop(job_id, None)
+        await clear_track_cards(context, job)
         if job.get("timer"):
             job["timer"].cancel()
         context.user_data.setdefault("findout_current", {}).pop((job["chat_id"], job.get("thread_id")), None)
@@ -3507,6 +3803,9 @@ async def findout_action_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer()
         return
     index = int(choice)
+    if index in detached_track_indexes(context, job):
+        await query.answer("Для этой песни уже открыт выбор загрузки.", show_alert=True)
+        return
     if index >= len(job["entries"]):
         await query.answer("Выберите запись заново.", show_alert=True)
         return
@@ -3515,6 +3814,7 @@ async def findout_action_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("Эта песня уже есть в чате.", show_alert=True)
         return
     selected = job.setdefault("selected", set())
+    previous_selected = set(selected)
     if index in selected:
         selected.remove(index)
     else:
@@ -3527,14 +3827,7 @@ async def findout_action_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
         job["timer"].cancel()
     job["timer"] = asyncio.create_task(expire_findout(context, job_id))
     await query.answer()
-    await query.edit_message_text(
-        track_list_text(
-            f"🔎 YouTube: выбрано {len(selected)} записей. Выбирайте кнопками по номеру в списке. ✅ — уже есть в чате.",
-            [(index, entry[1]) for index, entry in enumerate(job["entries"])],
-        ),
-        reply_markup=findout_markup(job_id, job, video_ids, song_keys),
-        disable_web_page_preview=True,
-    )
+    await update_track_controls(context, query, job_id, job, changed_indexes={index}, previous_selected=previous_selected)
 
 
 def stats_view(chat_id: int, user_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -3907,7 +4200,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(search_song_action, pattern=r"^searchsong:[a-f0-9]{12}:\d+$"))
     app.add_handler(CallbackQueryHandler(favorites_action, pattern=r"^fav:\d+:(?:\d+|close)$"))
     app.add_handler(CallbackQueryHandler(stats_action, pattern=r"^stats:\d+:(?:\d+|close)$"))
-    app.add_handler(CallbackQueryHandler(findout_action, pattern=r"^find:[a-f0-9]{12}:(?:\d+|download|close)$"))
+    app.add_handler(CallbackQueryHandler(findout_action, pattern=r"^find:[a-f0-9]{12}:(?:\d+|one:\d+|download|close)$"))
     app.add_handler(CallbackQueryHandler(cancel_download, pattern=r"^cancel:[a-f0-9]{12}$"))
     app.add_handler(CallbackQueryHandler(retry_download, pattern=r"^retry:[a-f0-9]{12}:(?:run|close)$"))
     app.add_handler(CallbackQueryHandler(
@@ -3916,7 +4209,7 @@ def main() -> None:
     ))
     app.add_handler(CallbackQueryHandler(
         select_playlist,
-        pattern=r"^mix:[a-f0-9]{12}:(?:toggle:\d+|page:\d+|select:(?:all|none)|remember:now|more:next|why:(?:show|back)|close:now|auto:mp3|download:(?:mp3|mp4)|quality:(?:(?:mp3:(?:128|192|320))|(?:mp4:(?:360|480|720))|back))$",
+        pattern=r"^mix:[a-f0-9]{12}:(?:one:\d+|toggle:\d+|page:\d+|select:(?:all|none)|remember:now|more:next|why:(?:show|back)|close:now|auto:mp3|download:(?:mp3|mp4)|quality:(?:(?:mp3:(?:128|192|320))|(?:mp4:(?:360|480|720))|back))$",
     ))
     app.add_handler(CallbackQueryHandler(
         send_media,
