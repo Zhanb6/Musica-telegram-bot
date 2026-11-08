@@ -147,7 +147,7 @@ def list_playlist(url: str, start: int = 1) -> tuple[str, list[tuple[str, str, s
             artist, track = music_metadata(entry)
             entries.append((
                 f"https://www.youtube.com/watch?v={video_id}",
-                entry.get("title") or video_id,
+                track_display_label(entry),
                 song_key(artist, track),
             ))
     if not entries and start == 1:
@@ -179,11 +179,39 @@ def search_youtube(query: str) -> list[tuple[str, str, str, int | None]]:
         duration = entry.get("duration")
         results.append((
             f"https://www.youtube.com/watch?v={video_id}",
-            str(entry.get("title") or title).replace("\n", " ").strip()[:150],
+            track_display_label(entry),
             song_key(artist, title),
             int(duration) if isinstance(duration, (int, float)) and duration >= 0 else None,
         ))
     return results
+
+
+def track_display_label(info: dict) -> str:
+    label = str(info.get("title") or info.get("track") or info.get("id") or "YouTube")
+    artists = info.get("artists")
+    artist = info.get("artist") or (
+        ", ".join(artists) if isinstance(artists, (list, tuple)) and artists else info.get("creator")
+    )
+    if artist and not re.search(r"(?<!\w)" + re.escape(str(artist).strip()) + r"(?!\w)", label, re.IGNORECASE):
+        label = f"{artist} - {label}"
+    return " ".join(label.split())
+
+
+def track_list_text(header: str, entries: list[tuple[int, str]]) -> str:
+    """Keep readable numbered labels outside buttons within Telegram's text limit."""
+    if not entries:
+        return header
+    header = header.encode("utf-16-le")[:2000].decode("utf-16-le", errors="ignore")
+    prefixes = [f"\n\n{index + 1}. " for index, _ in entries]
+    budget = (4000 - len((header + "".join(prefixes)).encode("utf-16-le")) // 2) // len(entries)
+    lines = [header]
+    for prefix, (_, label) in zip(prefixes, entries):
+        label = " ".join(label.split())
+        encoded = label.encode("utf-16-le")
+        if len(encoded) > budget * 2:
+            label = encoded[:(budget - 1) * 2].decode("utf-16-le", errors="ignore") + "…"
+        lines.append(prefix + label)
+    return "".join(lines)
 
 
 def extract_urls(text: str) -> tuple[list[str], int]:
@@ -2187,7 +2215,12 @@ def playlist_text(job: dict) -> str:
         text += "\nСледующую страницу пока не удалось получить. Попробуйте ещё раз."
     if job.get("auto_notice"):
         text += f"\n{job['auto_notice']}"
-    return text
+    start = job.get("page", 0) * PLAYLIST_PAGE_SIZE
+    return track_list_text(text, [
+        (index, entry[1]) for index, entry in enumerate(
+            job["entries"][start:start + PLAYLIST_PAGE_SIZE], start,
+        )
+    ])
 
 
 async def collect_auto_playlist(job: dict) -> tuple[list[tuple[str, str, str]], int]:
@@ -3227,7 +3260,10 @@ async def findout_command_impl(update: Update, context: ContextTypes.DEFAULT_TYP
     current[key] = job_id
     try:
         await status.edit_text(
-            f"🔎 YouTube: {search_text}\nОтметьте до 10 записей. ✅ — уже есть в чате.",
+            track_list_text(
+                f"🔎 YouTube: {search_text}\nОтметьте до 10 записей. ✅ — уже есть в чате.",
+                [(index, entry[1]) for index, entry in enumerate(results)],
+            ),
             reply_markup=findout_markup(job_id, searches[job_id], video_ids, song_keys),
         )
     except TelegramError as exc:
@@ -3446,7 +3482,10 @@ async def findout_action_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
     job["timer"] = asyncio.create_task(expire_findout(context, job_id))
     await query.answer()
     await query.edit_message_text(
-        f"🔎 YouTube: выбрано {len(selected)} записей. ✅ — уже есть в чате.",
+        track_list_text(
+            f"🔎 YouTube: выбрано {len(selected)} записей. ✅ — уже есть в чате.",
+            [(index, entry[1]) for index, entry in enumerate(job["entries"])],
+        ),
         reply_markup=findout_markup(job_id, job, video_ids, song_keys),
     )
 

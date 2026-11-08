@@ -960,6 +960,106 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["page"], 3)
         self.assertFalse(job["has_more"])
 
+    async def test_mix_link_shows_full_labels_and_keeps_page_numbers(self):
+        labels = [
+            f"Исполнитель с длинным именем {number} — Полное название композиции и приглашённые исполнители"
+            for number in range(9)
+        ]
+        entries = [(f"https://www.youtube.com/watch?v=video{n:06d}", label, "")
+                   for n, label in enumerate(labels)]
+        edits = []
+
+        async def edit_text(text, **kwargs):
+            edits.append((text, kwargs["reply_markup"]))
+
+        message = SimpleNamespace(
+            chat_id=7, message_id=88, text="https://www.youtube.com/playlist?list=RDvideo000001",
+            reply_text=AsyncMock(return_value=SimpleNamespace(edit_text=edit_text)),
+        )
+        with patch.object(bot, "list_playlist", return_value=("Mix", entries, False)):
+            await bot.receive_url(SimpleNamespace(effective_message=message), self.context)
+        for index, label in enumerate(labels[:8], 1):
+            self.assertIn(f"{index}. {label}", edits[-1][0])
+        self.assertNotIn(labels[8], edits[-1][0])
+        job_id = next(iter(self.context.user_data["mixes"]))
+        toggle = FakeQuery(f"mix:{job_id}:toggle:0")
+        await bot.select_playlist(SimpleNamespace(callback_query=toggle), self.context)
+        self.assertIn(labels[0], toggle.edits[-1][0])
+        page = FakeQuery(f"mix:{job_id}:page:1")
+        await bot.select_playlist(SimpleNamespace(callback_query=page), self.context)
+        self.assertIn(f"9. {labels[8]}", page.edits[-1][0])
+        self.assertNotIn(labels[0], page.edits[-1][0])
+        self.assertEqual(page.edits[-1][1].inline_keyboard[0][0].callback_data,
+                         f"mix:{job_id}:toggle:8")
+
+    def test_track_lists_stay_within_telegram_limit_for_long_unicode_labels(self):
+        entries = [(index, "🎵" * 5000) for index in range(10)]
+        text = bot.track_list_text("Результаты", entries)
+        self.assertLessEqual(len(text.encode("utf-16-le")) // 2, 4000)
+        for index in range(1, 11):
+            self.assertIn(f"\n\n{index}. ", text)
+        self.assertEqual(text.count("…"), 10)
+
+    def test_playlist_and_search_preserve_full_labels_and_separate_artist(self):
+        title = "Полное название композиции " * 8
+        artist = "Полное имя исполнителя " * 4
+        entry = {"id": "video000071", "title": title, "artist": artist, "duration": 169}
+
+        class FakeYoutubeDL:
+            def __init__(self, settings):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return None
+            def extract_info(self, url, download):
+                return {"_type": "playlist", "title": "Mix", "entries": [entry]}
+
+        expected = f"{artist.strip()} - {title.strip()}"
+        with patch.object(bot, "YoutubeDL", FakeYoutubeDL):
+            self.assertEqual(bot.list_playlist("https://www.youtube.com/playlist?list=PLtest")[1][0][1], expected)
+            self.assertEqual(bot.search_youtube("запрос")[0][1], expected)
+        self.assertEqual(bot.track_display_label({"artist": "Artist", "title": "Artist - Song"}),
+                         "Artist - Song")
+        for artist, title in (("M", "Money"), ("Muse", "Museum")):
+            with self.subTest(artist=artist):
+                self.assertEqual(bot.track_display_label({"artist": artist, "title": title}),
+                                 f"{artist} - {title}")
+
+    async def test_mix_remember_preserves_artist_and_title_from_producer_metadata(self):
+        class FakeYoutubeDL:
+            def __init__(self, settings):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return None
+            def extract_info(self, url, download):
+                return {"_type": "playlist", "title": "Mix", "entries": [
+                    {"id": "video000071", "artist": "Adele", "title": "Hello"},
+                ]}
+
+        status = SimpleNamespace(edit_text=AsyncMock())
+        message = SimpleNamespace(
+            chat_id=7, message_id=88, text="https://www.youtube.com/playlist?list=PLtest",
+            reply_text=AsyncMock(return_value=status),
+        )
+        with patch.object(bot, "YoutubeDL", FakeYoutubeDL):
+            await bot.receive_url(SimpleNamespace(effective_message=message), self.context)
+        job_id = next(iter(self.context.user_data["mixes"]))
+        self.assertIn("1. Adele - Hello", status.edit_text.await_args.args[0])
+        await bot.select_playlist(SimpleNamespace(callback_query=FakeQuery(f"mix:{job_id}:toggle:0")),
+                                  self.context)
+        await bot.select_playlist(SimpleNamespace(callback_query=FakeQuery(f"mix:{job_id}:remember:now")),
+                                  self.context)
+        with closing(bot.history_connection()) as connection:
+            row = connection.execute(
+                "SELECT artist, title, song_key FROM sent_tracks WHERE chat_id=? AND video_id=?",
+                (7, "video000071"),
+            ).fetchone()
+        self.assertEqual(row, ("Adele", "Hello", "adele|hello"))
+        self.assertNotIn(job_id, self.context.user_data["mixes"])
+
     async def test_hidden_track_explains_exact_match(self):
         old = "https://www.youtube.com/watch?v=video000041"
         new = "https://www.youtube.com/watch?v=video000042"
@@ -1229,9 +1329,10 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(options[0]["extract_flat"])
 
     async def test_findout_result_goes_through_format_and_quality(self):
+        label = "Jace June — Come Home (полное название песни с длинным подзаголовком и гостями)"
         results = [(
             "https://www.youtube.com/watch?v=video000072",
-            "Jace June - Come Home", bot.song_key("Jace June", "Come Home"), 169,
+            label, bot.song_key("Jace June", "Come Home"), 169,
         )]
         edits = []
         async def edit_text(text, **kwargs):
@@ -1246,10 +1347,12 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "search_youtube", return_value=results):
             await bot.findout_command(update, self.context)
         self.assertIn("[2:49]", edits[-1][1].inline_keyboard[0][0].text)
+        self.assertIn(f"1. {label}", edits[-1][0])
         job_id = next(iter(self.context.user_data["youtube_searches"]))
         pick = FakeQuery(f"find:{job_id}:0")
         await bot.findout_action(SimpleNamespace(callback_query=pick), self.context)
         self.assertIn("выбрано 1", pick.edits[-1][0])
+        self.assertIn(f"1. {label}", pick.edits[-1][0])
         download_selected = FakeQuery(f"find:{job_id}:download")
         await bot.findout_action(SimpleNamespace(callback_query=download_selected), self.context)
         self.assertIn("Теперь выберите формат", download_selected.edits[-1][0])
