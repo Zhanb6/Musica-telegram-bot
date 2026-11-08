@@ -2151,12 +2151,9 @@ def playlist_markup(job_id: str, job: dict) -> InlineKeyboardMarkup:
     start = page * PLAYLIST_PAGE_SIZE
     rows = []
     for index in range(start, min(start + PLAYLIST_PAGE_SIZE, len(entries))):
-        label = entries[index][1].replace("\n", " ").strip()
-        if len(label) > 48:
-            label = label[:47] + "…"
-        mark = "✅" if index in selected else "⬜"
+        label = "☑️ Выбран" if index in selected else "⬜ Выбрать"
         rows.append([InlineKeyboardButton(
-            f"{mark} {index + 1}. {label}", callback_data=f"mix:{job_id}:toggle:{index}"
+            f"{label} №{index + 1}", callback_data=f"mix:{job_id}:toggle:{index}"
         )])
     navigation = []
     if page > 0:
@@ -2199,7 +2196,7 @@ def playlist_markup(job_id: str, job: dict) -> InlineKeyboardMarkup:
 
 def playlist_text(job: dict) -> str:
     instruction = (
-        "Нажмите на треки, затем выберите формат." if job["entries"] else
+        "Выберите треки кнопками по номеру в списке, затем выберите формат." if job["entries"] else
         "Новых треков на этой странице нет. Посмотрите причины или откройте следующие 30."
     )
     text = (
@@ -2326,7 +2323,7 @@ async def receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "source_message_id": message.message_id,
         }
         jobs[job_id] = job
-        await status.edit_text(playlist_text(job), reply_markup=playlist_markup(job_id, job))
+        await status.edit_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
         return
 
     urls, invalid = extract_urls(message.text or "")
@@ -2371,13 +2368,13 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except (DownloadError, ValueError, OSError, sqlite3.Error) as exc:
             LOG.warning("Could not collect new playlist tracks: %s", exc)
             job["auto_notice"] = "Не удалось проверить весь Mix. Попробуйте ещё раз."
-            await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job))
+            await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
             return
         finally:
             job["auto_loading"] = False
         if not selected_entries:
             job["auto_notice"] = f"Среди первых {checked} позиций новых песен нет."
-            await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job))
+            await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
             return
         jobs.pop(job_id, None)
         urls = [entry[0] for entry in selected_entries]
@@ -2397,7 +2394,7 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 ]]),
             )
         else:
-            await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job))
+            await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
         return
     if action == "close":
         jobs.pop(job_id, None)
@@ -2497,7 +2494,7 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 context, job["source_chat_id"], job["source_message_id"], query.message.message_id,
             )
             return
-        await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job))
+        await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
         return
     elif action == "download":
         if not job["selected"]:
@@ -2512,7 +2509,7 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif action == "quality":
         if value == "back":
             await query.answer()
-            await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job))
+            await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
             return
         try:
             media_type, quality = value.split(":", 1)
@@ -2533,7 +2530,7 @@ async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     await query.answer()
-    await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job))
+    await query.edit_message_text(playlist_text(job), reply_markup=playlist_markup(job_id, job), disable_web_page_preview=True)
 
 
 async def send_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3261,10 +3258,11 @@ async def findout_command_impl(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         await status.edit_text(
             track_list_text(
-                f"🔎 YouTube: {search_text}\nОтметьте до 10 записей. ✅ — уже есть в чате.",
+                f"🔎 YouTube: {search_text}\nОтметьте до 10 записей кнопками по номеру в списке. ✅ — уже есть в чате.",
                 [(index, entry[1]) for index, entry in enumerate(results)],
             ),
             reply_markup=findout_markup(job_id, searches[job_id], video_ids, song_keys),
+            disable_web_page_preview=True,
         )
     except TelegramError as exc:
         LOG.warning("Could not show YouTube search results: %s", exc)
@@ -3286,13 +3284,13 @@ async def findout_command_impl(update: Update, context: ContextTypes.DEFAULT_TYP
 def findout_markup(job_id: str, job: dict, video_ids: set, song_keys: set) -> InlineKeyboardMarkup:
     rows = []
     selected = job.setdefault("selected", set())
-    for index, (url, label, key, duration) in enumerate(job["entries"]):
+    for index, (url, _, key, duration) in enumerate(job["entries"]):
         video_id = parse_qs(urlsplit(url).query)["v"][0]
         saved = video_id in video_ids or bool(key and key in song_keys)
-        mark = "✅" if saved else "☑️" if index in selected else "🎵"
+        label = "✅ Уже есть" if saved else "☑️ Выбран" if index in selected else "⬜ Выбрать"
         time_label = f" [{duration // 60}:{duration % 60:02d}]" if duration is not None else ""
         rows.append([InlineKeyboardButton(
-            f"{mark} {index + 1}. {label[:42]}{time_label}", callback_data=f"find:{job_id}:{index}",
+            f"{label} №{index + 1}{time_label}", callback_data=f"find:{job_id}:{index}",
         )])
     rows.append([InlineKeyboardButton(
         f"⬇️ Скачать выбранные ({len(selected)})", callback_data=f"find:{job_id}:download",
@@ -3483,10 +3481,11 @@ async def findout_action_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     await query.edit_message_text(
         track_list_text(
-            f"🔎 YouTube: выбрано {len(selected)} записей. ✅ — уже есть в чате.",
+            f"🔎 YouTube: выбрано {len(selected)} записей. Выбирайте кнопками по номеру в списке. ✅ — уже есть в чате.",
             [(index, entry[1]) for index, entry in enumerate(job["entries"])],
         ),
         reply_markup=findout_markup(job_id, job, video_ids, song_keys),
+        disable_web_page_preview=True,
     )
 
 

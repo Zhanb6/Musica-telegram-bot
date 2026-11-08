@@ -86,11 +86,13 @@ class FakeQuery:
         self.from_user = SimpleNamespace(id=42)
         self.message = SimpleNamespace(chat_id=7, message_id=99, chat=SimpleNamespace(type="private"))
         self.edits = []
+        self.edit_kwargs = []
         self.answers = []
         self.on_edit = on_edit
 
     async def edit_message_text(self, text, **kwargs):
         self.edits.append((text, kwargs.get("reply_markup")))
+        self.edit_kwargs.append(kwargs)
         if self.on_edit:
             self.on_edit()
 
@@ -970,6 +972,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         edits = []
 
         async def edit_text(text, **kwargs):
+            self.assertTrue(kwargs.get("disable_web_page_preview"))
             edits.append((text, kwargs["reply_markup"]))
 
         message = SimpleNamespace(
@@ -981,14 +984,20 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         for index, label in enumerate(labels[:8], 1):
             self.assertIn(f"{index}. {label}", edits[-1][0])
         self.assertNotIn(labels[8], edits[-1][0])
+        self.assertIn("по номеру", edits[-1][0])
+        self.assertEqual(edits[-1][1].inline_keyboard[0][0].text, "⬜ Выбрать №1")
         job_id = next(iter(self.context.user_data["mixes"]))
         toggle = FakeQuery(f"mix:{job_id}:toggle:0")
         await bot.select_playlist(SimpleNamespace(callback_query=toggle), self.context)
         self.assertIn(labels[0], toggle.edits[-1][0])
+        self.assertTrue(toggle.edit_kwargs[-1]["disable_web_page_preview"])
+        self.assertEqual(toggle.edits[-1][1].inline_keyboard[0][0].text, "☑️ Выбран №1")
         page = FakeQuery(f"mix:{job_id}:page:1")
         await bot.select_playlist(SimpleNamespace(callback_query=page), self.context)
         self.assertIn(f"9. {labels[8]}", page.edits[-1][0])
         self.assertNotIn(labels[0], page.edits[-1][0])
+        self.assertTrue(page.edit_kwargs[-1]["disable_web_page_preview"])
+        self.assertEqual(page.edits[-1][1].inline_keyboard[0][0].text, "⬜ Выбрать №9")
         self.assertEqual(page.edits[-1][1].inline_keyboard[0][0].callback_data,
                          f"mix:{job_id}:toggle:8")
 
@@ -1336,6 +1345,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )]
         edits = []
         async def edit_text(text, **kwargs):
+            self.assertTrue(kwargs.get("disable_web_page_preview"))
             edits.append((text, kwargs.get("reply_markup")))
         async def reply_text(text, **kwargs):
             return SimpleNamespace(message_id=99, edit_text=edit_text)
@@ -1348,11 +1358,15 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await bot.findout_command(update, self.context)
         self.assertIn("[2:49]", edits[-1][1].inline_keyboard[0][0].text)
         self.assertIn(f"1. {label}", edits[-1][0])
+        self.assertIn("по номеру", edits[-1][0])
+        self.assertEqual(edits[-1][1].inline_keyboard[0][0].text, "⬜ Выбрать №1 [2:49]")
         job_id = next(iter(self.context.user_data["youtube_searches"]))
         pick = FakeQuery(f"find:{job_id}:0")
         await bot.findout_action(SimpleNamespace(callback_query=pick), self.context)
         self.assertIn("выбрано 1", pick.edits[-1][0])
         self.assertIn(f"1. {label}", pick.edits[-1][0])
+        self.assertTrue(pick.edit_kwargs[-1]["disable_web_page_preview"])
+        self.assertEqual(pick.edits[-1][1].inline_keyboard[0][0].text, "☑️ Выбран №1 [2:49]")
         download_selected = FakeQuery(f"find:{job_id}:download")
         await bot.findout_action(SimpleNamespace(callback_query=download_selected), self.context)
         self.assertIn("Теперь выберите формат", download_selected.edits[-1][0])
@@ -1556,7 +1570,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "search_youtube", return_value=results), patch.object(bot, "SEARCH_UI_TIMEOUT", 0.2):
             await bot.findout_command(update, self.context)
             self.assertEqual(self.fake_bot.deleted, [88])
-            self.assertIn("✅", status_edits[-1][1].inline_keyboard[1][0].text)
+            self.assertEqual(status_edits[-1][1].inline_keyboard[1][0].text, "✅ Уже есть №2 [2:01]")
             job_id = next(iter(self.context.user_data["youtube_searches"]))
 
             def choice(value, user_id=42, thread=77):
