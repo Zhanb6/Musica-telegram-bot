@@ -22,7 +22,7 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TIT2, TPE1
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from telethon import TelegramClient, events, types
@@ -1220,21 +1220,70 @@ def download_media(
     return file_path, artist, title, cover
 
 
+def navigation_keyboard(screen: str = "main") -> ReplyKeyboardMarkup:
+    if screen == "main":
+        rows = [["🎵 Скачать музыку"], ["🎵 Моя музыка"]]
+    elif screen == "download":
+        rows = [["🔗 По ссылке", "🔎 Найти песню"], ["🎵 Моя музыка"], ["◀️ Назад", "🏠 Главное меню"]]
+    else:
+        rows = [["✖️ Отмена", "◀️ Назад"], ["🏠 Главное меню"]]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    key = (message.chat_id, getattr(message, "message_thread_id", None))
+    context.user_data.setdefault("navigation", {}).pop(key, None)
+    await message.reply_text(
+        "Выберите действие кнопками: скачать музыку или открыть свою библиотеку. "
+        "Ссылку на YouTube также можно отправить сразу.",
+        reply_markup=navigation_keyboard(),
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.args and context.args[0].startswith("share_"):
         await open_shared_playlist(update, context, context.args[0][6:])
         return
-    await update.effective_message.reply_text(
-        "Пришлите одну или несколько ссылок на видео YouTube (до 10 в одном сообщении). "
-        "Если пришлёте ссылку на Mix, можно будет выбрать треки из списка или скачать 30 новых MP3 одной кнопкой. "
-        "Я предложу скачать MP3 или MP4 и выбрать качество. "
-        "Файл должен быть не больше 50 МБ. Во время загрузки можно нажать «Отменить», "
-        "а неудачные ссылки повторить кнопкой. /artists — разделы музыки, /search — поиск, "
-        "/stats — статистика, /findout запрос — поиск на YouTube. "
-        "Ответьте /favorite на песню, чтобы добавить её в /favorites. "
-        "/zip — скачать свою библиотеку ZIP частями, /share — ссылка на подборку MP3. "
-        "В нужной теме отправьте /renametopic Новое название, чтобы переименовать её."
-    )
+    await show_main_menu(update, context)
+
+
+async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    text = (message.text or "").strip()
+    key = (message.chat_id, getattr(message, "message_thread_id", None))
+    navigation = context.user_data.setdefault("navigation", {})
+    screen = navigation.get(key)
+    if text in {"🏠 Главное меню", "✖️ Отмена"}:
+        await show_main_menu(update, context)
+    elif text == "🎵 Скачать музыку" or (text == "◀️ Назад" and screen in {"search", "link"}):
+        navigation[key] = "download"
+        await message.reply_text("Как найти музыку?", reply_markup=navigation_keyboard("download"))
+    elif text == "◀️ Назад":
+        await show_main_menu(update, context)
+    elif text in {"🔗 По ссылке", "🔎 Найти песню"}:
+        navigation[key] = "link" if text == "🔗 По ссылке" else "search"
+        prompt = (
+            "Пришлите ссылку на YouTube или Mix. Можно отправить до 10 ссылок в одном сообщении."
+            if navigation[key] == "link" else
+            "Напишите название песни, исполнителя или оба обычным сообщением."
+        )
+        await message.reply_text(prompt, reply_markup=navigation_keyboard("input"))
+    elif text == "🎵 Моя музыка":
+        await show_main_menu(update, context)
+        await artists_command(update, context)
+    elif any(normalize_youtube_url(raw.rstrip(".,!?;:)]}")) or normalize_playlist_url(raw.rstrip(".,!?;:)]}"))
+             for raw in URL.findall(text)):
+        await receive_url(update, context)
+    elif screen == "search":
+        await findout_command(update, context, search_text=text)
+    elif screen == "link":
+        await message.reply_text(
+            "Нужна ссылка на YouTube или Mix. Пришлите её обычным сообщением.",
+            reply_markup=navigation_keyboard("input"),
+        )
+    else:
+        await show_main_menu(update, context)
 
 
 def queue_transient_cleanup(chat_id: int, message_ids: tuple[int, ...], delay: float, *, active=False) -> None:
@@ -3184,27 +3233,26 @@ async def search_song_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
 
 
-async def findout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def findout_command(update: Update, context: ContextTypes.DEFAULT_TYPE, search_text: str | None = None) -> None:
     message = update.effective_message
     key = (message.chat_id, getattr(message, "message_thread_id", None))
     lock = context.user_data.setdefault("search_panel_locks", {}).setdefault(key, asyncio.Lock())
     async with lock:
-        await findout_command_impl(update, context)
+        await findout_command_impl(update, context, search_text)
 
 
-async def findout_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def findout_command_impl(update: Update, context: ContextTypes.DEFAULT_TYPE, search_text: str | None = None) -> None:
     message = update.effective_message
-    search_text = " ".join(context.args).strip()
+    search_text = (" ".join(context.args) if search_text is None else search_text).strip()
     key = (message.chat_id, getattr(message, "message_thread_id", None))
     await clear_saved_search_ui(context, key)
     await clear_findout_ui(context, key)
     current = context.user_data.setdefault("findout_current", {})
     if len(search_text) < 2 or len(search_text) > 150:
+        context.user_data.setdefault("navigation", {})[key] = "search"
         status = await message.reply_text(
-            "Напишите /findout и название песни, исполнителя или оба. Например: /findout Jace June Come Home",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✖️ Закрыть", callback_data=f"searchclose:{update.effective_user.id}"),
-            ]]),
+            "Напишите название песни, исполнителя или оба: от 2 до 150 символов. Например: Jace June Come Home",
+            reply_markup=navigation_keyboard("input"),
         )
         try:
             await message.delete()
@@ -3273,7 +3321,7 @@ async def findout_command_impl(update: Update, context: ContextTypes.DEFAULT_TYP
         except TelegramError:
             pass
         try:
-            error = await message.reply_text("Не удалось показать результаты. Повторите /findout.")
+            error = await message.reply_text("Не удалось показать результаты. Повторите поиск.")
         except TelegramError:
             return
         schedule_findout_empty(context, key, error.message_id)
@@ -3389,7 +3437,7 @@ async def findout_action_impl(update: Update, context: ContextTypes.DEFAULT_TYPE
     searches = context.user_data.setdefault("youtube_searches", {})
     job = searches.get(job_id)
     if job is None or job["chat_id"] != query.message.chat_id:
-        await query.answer("Поиск устарел. Отправьте /findout ещё раз.", show_alert=True)
+        await query.answer("Поиск устарел. Нажмите «Найти песню» и повторите поиск.", show_alert=True)
         return
     if job["user_id"] != query.from_user.id:
         await query.answer("Это чужой поиск.", show_alert=True)
@@ -3732,7 +3780,8 @@ async def library_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def configure_commands(app: Application) -> None:
     try:
         await app.bot.set_my_commands([
-            BotCommand("start", "Как пользоваться ботом"),
+            BotCommand("menu", "Открыть меню кнопок"),
+            BotCommand("start", "Открыть меню и справку"),
             BotCommand("artists", "Музыка по исполнителям"),
             BotCommand("renametopic", "Переименовать текущую тему"),
             BotCommand("zip", "Скачать свои MP3 ZIP частями"),
@@ -3837,6 +3886,7 @@ def main() -> None:
         .post_init(configure_commands).post_shutdown(stop_reaction_listener).build()
     )
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", show_main_menu))
     app.add_handler(CommandHandler("artists", artists_command))
     app.add_handler(CommandHandler("renametopic", rename_topic_command))
     app.add_handler(CommandHandler("zip", zip_command))
@@ -3872,7 +3922,7 @@ def main() -> None:
         send_media,
         pattern=r"^(?:(?:mp3|mp4):[a-f0-9]{12}|format:[a-f0-9]{12}:(?:back|close)|quality:[a-f0-9]{12}:(?:mp3:(?:128|192|320)|mp4:(?:360|480|720)))$",
     ))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_url))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text))
     LOG.info("Bot started")
     app.run_polling()
 

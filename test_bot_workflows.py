@@ -142,6 +142,136 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         return update, message
 
+    def navigation_update(self, text, chat_id=7, thread_id=None):
+        status = SimpleNamespace(message_id=99, edit_text=AsyncMock())
+        message = SimpleNamespace(
+            chat_id=chat_id, message_id=88, message_thread_id=thread_id, text=text,
+            reply_text=AsyncMock(return_value=status), delete=AsyncMock(),
+        )
+        return SimpleNamespace(
+            effective_message=message, effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=chat_id, type="private"),
+        )
+
+    async def test_navigation_start_submenu_back_and_cancel(self):
+        self.context.args = []
+        update = self.navigation_update("/start")
+        await bot.start(update, self.context)
+        markup = update.effective_message.reply_text.await_args.kwargs["reply_markup"]
+        self.assertTrue(markup.is_persistent)
+        self.assertEqual([[button.text for button in row] for row in markup.keyboard],
+                         [["🎵 Скачать музыку"], ["🎵 Моя музыка"]])
+        for control in ("◀️ Назад", "✖️ Отмена", "🏠 Главное меню"):
+            with self.subTest(control=control):
+                await bot.receive_text(self.navigation_update("🎵 Скачать музыку"), self.context)
+                self.assertEqual(self.context.user_data["navigation"][(7, None)], "download")
+                await bot.receive_text(self.navigation_update("🔎 Найти песню"), self.context)
+                self.assertEqual(self.context.user_data["navigation"][(7, None)], "search")
+                await bot.receive_text(self.navigation_update(control), self.context)
+                self.assertNotEqual(self.context.user_data["navigation"].get((7, None)), "search")
+                if control == "◀️ Назад":
+                    self.assertEqual(self.context.user_data["navigation"][(7, None)], "download")
+                    await bot.receive_text(self.navigation_update(control), self.context)
+                self.assertNotIn((7, None), self.context.user_data["navigation"])
+
+    async def test_navigation_search_runs_findout_with_plain_text_and_can_retry_invalid_query(self):
+        self.context.args = ["stale", "command", "args"]
+        await bot.receive_text(self.navigation_update("🔎 Найти песню"), self.context)
+        invalid = self.navigation_update("a")
+        await bot.receive_text(invalid, self.context)
+        self.assertNotIn("/findout", invalid.effective_message.reply_text.await_args.args[0])
+        self.assertEqual(self.context.user_data["navigation"][(7, None)], "search")
+        result = ("https://www.youtube.com/watch?v=video000071", "Adele - Hello", "adele|hello", 180)
+        query = self.navigation_update("Adele Hello")
+        with patch.object(bot, "search_youtube", return_value=[result]) as search:
+            await bot.receive_text(query, self.context)
+        search.assert_called_once_with("Adele Hello")
+        job = next(iter(self.context.user_data["youtube_searches"].values()))
+        self.assertEqual(job["entries"], [result])
+        self.assertEqual(self.context.args, ["stale", "command", "args"])
+        status = query.effective_message.reply_text.return_value
+        self.assertIn("1. Adele - Hello", status.edit_text.await_args.args[0])
+
+    async def test_navigation_urls_work_in_every_mode_and_library_clears_input(self):
+        urls = ("https://youtu.be/video000071", "https://www.youtube.com/playlist?list=PLtest")
+        for mode in (None, "download", "search", "link"):
+            for url in urls:
+                with self.subTest(mode=mode, url=url):
+                    self.context.user_data["navigation"] = {(7, None): mode}
+                    update = self.navigation_update(url)
+                    with patch.object(bot, "receive_url", new_callable=AsyncMock) as receive:
+                        await bot.receive_text(update, self.context)
+                    receive.assert_awaited_once_with(update, self.context)
+        await bot.receive_text(self.navigation_update("🔗 По ссылке"), self.context)
+        self.assertEqual(self.context.user_data["navigation"][(7, None)], "link")
+        invalid = self.navigation_update("some text")
+        with patch.object(bot, "findout_command", new_callable=AsyncMock) as search:
+            await bot.receive_text(invalid, self.context)
+        search.assert_not_awaited()
+        self.assertIn("ссылка", invalid.effective_message.reply_text.await_args.args[0])
+        library = self.navigation_update("🎵 Моя музыка")
+        with patch.object(bot, "artists_command", new_callable=AsyncMock) as artists:
+            await bot.receive_text(library, self.context)
+        artists.assert_awaited_once_with(library, self.context)
+        self.assertNotIn((7, None), self.context.user_data["navigation"])
+
+    async def test_invalid_findout_command_enters_plain_text_search_without_changing_args(self):
+        for args in ([], ["a"], ["a" * 151]):
+            with self.subTest(args=args):
+                self.context.args = args
+                command = self.navigation_update("/findout", thread_id=77)
+                await bot.findout_command(command, self.context)
+                self.assertEqual(self.context.user_data["navigation"][(7, 77)], "search")
+                markup = command.effective_message.reply_text.await_args.kwargs["reply_markup"]
+                self.assertTrue(markup.is_persistent)
+                self.assertIn("✖️ Отмена", [button.text for row in markup.keyboard for button in row])
+                self.assertIn((7, 77), self.context.user_data["findout_empty_ui"])
+                command.effective_message.delete.assert_awaited_once()
+                query = self.navigation_update("Adele Hello", thread_id=77)
+                with patch.object(bot, "search_youtube", return_value=[]) as search:
+                    await bot.receive_text(query, self.context)
+                search.assert_called_once_with("Adele Hello")
+                self.assertEqual(self.context.args, args)
+                self.assertIn(99, self.fake_bot.deleted)
+
+    async def test_navigation_pending_input_is_isolated_by_chat_topic_and_unknown_text_opens_menu(self):
+        await bot.receive_text(self.navigation_update("🔎 Найти песню", thread_id=77), self.context)
+        with patch.object(bot, "findout_command", new_callable=AsyncMock) as search:
+            for chat_id, topic in ((8, 77), (7, None), (7, 78)):
+                update = self.navigation_update("Adele Hello", chat_id, topic)
+                await bot.receive_text(update, self.context)
+                self.assertTrue(update.effective_message.reply_text.await_args.kwargs["reply_markup"].is_persistent)
+            search.assert_not_awaited()
+            update = self.navigation_update("Adele Hello", thread_id=77)
+            await bot.receive_text(update, self.context)
+            search.assert_awaited_once_with(update, self.context, search_text="Adele Hello")
+        await bot.show_main_menu(self.navigation_update("/menu", thread_id=77), self.context)
+        self.assertNotIn((7, 77), self.context.user_data["navigation"])
+
+    async def test_navigation_preserves_share_start_payload_and_command_search(self):
+        update = self.navigation_update("/start share_example")
+        self.context.args = ["share_example"]
+        with patch.object(bot, "open_shared_playlist", new_callable=AsyncMock) as shared:
+            await bot.start(update, self.context)
+        shared.assert_awaited_once_with(update, self.context, "example")
+        update.effective_message.reply_text.assert_not_awaited()
+        self.context.args = ["Adele", "Hello"]
+        with patch.object(bot, "search_youtube", return_value=[]) as search:
+            await bot.findout_command(self.navigation_update("/findout Adele Hello"), self.context)
+        search.assert_called_once_with("Adele Hello")
+
+    async def test_navigation_menu_command_is_first_in_telegram_command_list(self):
+        self.fake_bot.set_my_commands = AsyncMock()
+        with patch.object(bot, "resume_transient_cleanup"), \
+             patch.object(bot, "resume_pending_shared_syncs", new_callable=AsyncMock), \
+             patch.object(bot, "start_reaction_listener", new_callable=AsyncMock), \
+             patch.object(bot, "reconcile_favorite_topic", new_callable=AsyncMock):
+            await bot.configure_commands(self.context.application)
+            await asyncio.sleep(0)
+        commands = self.fake_bot.set_my_commands.await_args.args[0]
+        self.assertEqual(commands[0].command, "menu")
+        self.assertIn("findout", [command.command for command in commands])
+
     async def test_rename_topic_keeps_thread_mapping(self):
         with closing(bot.history_connection()) as connection:
             with connection:
