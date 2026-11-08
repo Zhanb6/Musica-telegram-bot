@@ -35,6 +35,7 @@ LOG = logging.getLogger(__name__)
 HISTORY_DB = Path(os.getenv("TELEGA_DB_PATH") or Path(__file__).with_name("downloads.sqlite3"))
 MAX_FILE_BYTES = 50_000_000  # Telegram Bot API upload limit
 MAX_BATCH = 10
+NAVIGATION_BUTTONS = {"🏠 Главное меню", "✖️ Отмена", "🎵 Скачать музыку", "◀️ Назад", "🔗 По ссылке", "🔎 Найти песню", "🎵 Моя музыка"}
 SEARCH_RESULT_LIMIT = 10
 SEARCH_UI_TIMEOUT = 120
 PLAYLIST_LIMIT = 30
@@ -1437,11 +1438,53 @@ def navigation_keyboard(screen: str = "main") -> ReplyKeyboardMarkup:
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     key = (message.chat_id, getattr(message, "message_thread_id", None))
+    lock = context.user_data.setdefault("search_panel_locks", {}).setdefault(key, asyncio.Lock())
+    async with lock:
+        await show_main_menu_impl(update, context)
+
+
+async def clear_navigation_prompt(context, key: tuple[int, int | None]) -> None:
+    message_id = context.user_data.setdefault("navigation_prompts", {}).pop(key, None)
+    if message_id is not None:
+        empty = context.user_data.setdefault("findout_empty_ui", {}).get(key)
+        if empty and empty["message_id"] == message_id:
+            empty["task"].cancel()
+            context.user_data["findout_empty_ui"].pop(key, None)
+        try:
+            await context.bot.delete_message(chat_id=key[0], message_id=message_id)
+        except TelegramError:
+            pass
+
+
+async def navigation_prompt(update, context, text: str, screen: str):
+    message = update.effective_message
+    key = (message.chat_id, getattr(message, "message_thread_id", None))
+    await clear_navigation_prompt(context, key)
+    sent = await message.reply_text(text, reply_markup=navigation_keyboard(screen), do_quote=False)
+    context.user_data.setdefault("navigation_prompts", {})[key] = sent.message_id
+    schedule_transient_cleanup(context.bot, message.chat_id, (sent.message_id,), SEARCH_UI_TIMEOUT)
+    return sent
+
+
+async def clear_pending_ui(context, key: tuple[int, int | None]) -> None:
+    await clear_navigation_prompt(context, key)
+    for job_id, job in list(context.user_data.setdefault("mixes", {}).items()):
+        if (job["source_chat_id"], job.get("thread_id")) == key:
+            context.user_data["mixes"].pop(job_id, None)
+            await clear_track_cards(context, job)
+            await delete_batch_messages(context, key[0], job["source_message_id"], job["status_message_id"])
+    await clear_findout_ui(context, key)
+
+
+async def show_main_menu_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    key = (message.chat_id, getattr(message, "message_thread_id", None))
+    await clear_pending_ui(context, key)
     context.user_data.setdefault("navigation", {}).pop(key, None)
-    await message.reply_text(
+    await navigation_prompt(update, context,
         "Выберите действие кнопками: скачать музыку или открыть свою библиотеку. "
         "Ссылку на YouTube также можно отправить сразу.",
-        reply_markup=navigation_keyboard(),
+        "main",
     )
 
 
@@ -1454,17 +1497,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
+    key = (message.chat_id, getattr(message, "message_thread_id", None))
+    lock = context.user_data.setdefault("search_panel_locks", {}).setdefault(key, asyncio.Lock())
+    async with lock:
+        try:
+            await receive_text_impl(update, context)
+        finally:
+            if (message.text or "").strip() in NAVIGATION_BUTTONS:
+                try:
+                    await context.bot.delete_message(chat_id=message.chat_id, message_id=message.message_id)
+                except TelegramError:
+                    pass
+
+
+async def receive_text_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
     text = (message.text or "").strip()
     key = (message.chat_id, getattr(message, "message_thread_id", None))
     navigation = context.user_data.setdefault("navigation", {})
     screen = navigation.get(key)
+    if text in NAVIGATION_BUTTONS:
+        await clear_pending_ui(context, key)
     if text in {"🏠 Главное меню", "✖️ Отмена"}:
-        await show_main_menu(update, context)
+        await show_main_menu_impl(update, context)
     elif text == "🎵 Скачать музыку" or (text == "◀️ Назад" and screen in {"search", "link"}):
         navigation[key] = "download"
-        await message.reply_text("Как найти музыку?", reply_markup=navigation_keyboard("download"))
+        await navigation_prompt(update, context, "Как найти музыку?", "download")
     elif text == "◀️ Назад":
-        await show_main_menu(update, context)
+        await show_main_menu_impl(update, context)
     elif text in {"🔗 По ссылке", "🔎 Найти песню"}:
         navigation[key] = "link" if text == "🔗 По ссылке" else "search"
         prompt = (
@@ -1472,22 +1532,19 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if navigation[key] == "link" else
             "Напишите название песни, исполнителя или оба обычным сообщением."
         )
-        await message.reply_text(prompt, reply_markup=navigation_keyboard("input"))
+        await navigation_prompt(update, context, prompt, "input")
     elif text == "🎵 Моя музыка":
-        await show_main_menu(update, context)
+        await show_main_menu_impl(update, context)
         await artists_command(update, context)
     elif any(normalize_youtube_url(raw.rstrip(".,!?;:)]}")) or normalize_playlist_url(raw.rstrip(".,!?;:)]}"))
              for raw in URL.findall(text)):
-        await receive_url(update, context)
+        await receive_url_impl(update, context)
     elif screen == "search":
-        await findout_command(update, context, search_text=text)
+        await findout_command_impl(update, context, search_text=text)
     elif screen == "link":
-        await message.reply_text(
-            "Нужна ссылка на YouTube или Mix. Пришлите её обычным сообщением.",
-            reply_markup=navigation_keyboard("input"),
-        )
+        await navigation_prompt(update, context, "Нужна ссылка на YouTube или Mix. Пришлите её обычным сообщением.", "input")
     else:
-        await show_main_menu(update, context)
+        await show_main_menu_impl(update, context)
 
 
 def queue_transient_cleanup(chat_id: int, message_ids: tuple[int, ...], delay: float, *, active=False) -> None:
@@ -2546,16 +2603,9 @@ async def receive_url_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     message = update.effective_message
     raw_urls = [raw.rstrip(".,!?;:)]}") for raw in URL.findall(message.text or "")]
     playlist_urls = [url for raw in raw_urls if (url := normalize_playlist_url(raw))]
+    key = (message.chat_id, getattr(message, "message_thread_id", None))
+    await clear_pending_ui(context, key)
     if len(raw_urls) == 1 and playlist_urls:
-        for old_id, old in list(context.user_data.setdefault("mixes", {}).items()):
-            if (old["source_chat_id"], old.get("thread_id")) == (message.chat_id, getattr(message, "message_thread_id", None)):
-                context.user_data["mixes"].pop(old_id, None)
-                await clear_track_cards(context, old)
-                if old.get("status_message_id"):
-                    try:
-                        await context.bot.delete_message(chat_id=message.chat_id, message_id=old["status_message_id"])
-                    except TelegramError:
-                        pass
         status = await message.reply_text("Получаю список треков…")
         try:
             title, entries, has_more = await asyncio.to_thread(list_playlist, playlist_urls[0])
@@ -2609,13 +2659,22 @@ async def receive_url_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if len(jobs) >= 10:
         jobs.pop(next(iter(jobs)))
     job_id = uuid4().hex[:12]
-    jobs[job_id] = (urls, message.chat_id, message.message_id)
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🎵 MP3", callback_data=f"mp3:{job_id}"),
-        InlineKeyboardButton("🎬 MP4", callback_data=f"mp4:{job_id}"),
-    ]])
+    jobs[job_id] = (
+        urls, message.chat_id, message.message_id, update.effective_user.id, {}, key[1],
+    )
     note = f" Пропущено некорректных ссылок: {invalid}." if invalid else ""
-    await message.reply_text(f"Принято ссылок: {len(urls)}. Выберите формат для всех:{note}", reply_markup=keyboard)
+    status = await message.reply_text(
+        f"Принято ссылок: {len(urls)}. Выберите формат для всех:{note}",
+        reply_markup=format_markup(job_id, dismiss=True), disable_web_page_preview=True,
+    )
+    record = {
+        "chat_id": message.chat_id, "thread_id": key[1], "message_id": status.message_id,
+        "cleanup_ids": (message.message_id, status.message_id),
+        "task": asyncio.create_task(expire_findout_format(context, job_id)),
+    }
+    context.user_data.setdefault("findout_format_timers", {})[job_id] = record
+    queue_transient_cleanup(message.chat_id, record["cleanup_ids"], SEARCH_UI_TIMEOUT, active=True)
+
 
 
 async def select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2934,8 +2993,12 @@ async def send_media_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if parts[2] == "close":
                 try:
                     record = context.user_data.setdefault("findout_format_timers", {}).get(job_id)
+                    forget_format_cleanup(record)
                     if not await restore_track_card(context, job_id, record):
-                        await context.bot.delete_message(chat_id=job[1], message_id=query.message.message_id)
+                        if record and record.get("cleanup_ids"):
+                            await delete_format_messages(context, record)
+                        else:
+                            await context.bot.delete_message(chat_id=job[1], message_id=query.message.message_id)
                 except TelegramError as exc:
                     LOG.warning("Could not close format selection: %s", exc)
                     await query.answer("Не удалось убрать сообщение. Попробуйте ещё раз.", show_alert=True)
@@ -2991,6 +3054,7 @@ async def send_media_impl(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data["findout_format_timers"].pop(job_id, None)
     if format_timer:
         format_timer["task"].cancel()
+        forget_format_cleanup(format_timer)
     jobs.pop(job_id)
     await query.answer()
     urls, source_chat_id, source_message_id = job[:3]
@@ -3325,14 +3389,13 @@ async def clear_findout_ui(context, key: tuple[int, int | None]) -> None:
         except TelegramError:
             pass
     for format_id, record in list(context.user_data.setdefault("findout_format_timers", {}).items()):
-        if (record["chat_id"], record["thread_id"]) == key:
+        if ((record["chat_id"], record["thread_id"]) == key
+                and format_id not in context.application.bot_data.setdefault("active_batches", {})):
             record["task"].cancel()
             context.user_data["findout_format_timers"].pop(format_id, None)
             context.user_data.setdefault("jobs", {}).pop(format_id, None)
-            try:
-                await context.bot.delete_message(chat_id=key[0], message_id=record["message_id"])
-            except TelegramError:
-                pass
+            forget_format_cleanup(record)
+            await delete_format_messages(context, record)
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3529,13 +3592,12 @@ async def findout_command_impl(update: Update, context: ContextTypes.DEFAULT_TYP
     search_text = (" ".join(context.args) if search_text is None else search_text).strip()
     key = (message.chat_id, getattr(message, "message_thread_id", None))
     await clear_saved_search_ui(context, key)
-    await clear_findout_ui(context, key)
+    await clear_pending_ui(context, key)
     current = context.user_data.setdefault("findout_current", {})
     if len(search_text) < 2 or len(search_text) > 150:
         context.user_data.setdefault("navigation", {})[key] = "search"
-        status = await message.reply_text(
-            "Напишите название песни, исполнителя или оба: от 2 до 150 символов. Например: Jace June Come Home",
-            reply_markup=navigation_keyboard("input"),
+        status = await navigation_prompt(update, context,
+            "Напишите название песни, исполнителя или оба: от 2 до 150 символов. Например: Jace June Come Home", "input",
         )
         try:
             await message.delete()
@@ -3665,10 +3727,31 @@ async def expire_findout_empty(context, key: tuple[int, int | None], message_id:
     if empty.get(key, {}).get("message_id") != message_id:
         return
     empty.pop(key, None)
+    if context.user_data.setdefault("navigation_prompts", {}).get(key) == message_id:
+        context.user_data["navigation_prompts"].pop(key, None)
     try:
         await context.bot.delete_message(chat_id=key[0], message_id=message_id)
     except TelegramError:
         pass
+
+
+def forget_format_cleanup(record: dict | None) -> None:
+    if record and record.get("cleanup_ids"):
+        with closing(history_connection()) as connection:
+            with connection:
+                connection.executemany(
+                    "DELETE FROM transient_message_cleanup WHERE chat_id=? AND message_id=?",
+                    ((record["chat_id"], message_id) for message_id in record["cleanup_ids"]),
+                )
+
+
+async def delete_format_messages(context, record: dict) -> None:
+    for message_id in record.get("cleanup_ids", (record["message_id"],)):
+        try:
+            await context.bot.delete_message(chat_id=record["chat_id"], message_id=message_id)
+        except TelegramError:
+            if record.get("cleanup_ids"):
+                schedule_transient_cleanup(context.bot, record["chat_id"], (message_id,), 0)
 
 
 def refresh_findout_format_timer(context, job_id: str) -> None:
@@ -3676,6 +3759,8 @@ def refresh_findout_format_timer(context, job_id: str) -> None:
     if record:
         record["task"].cancel()
         record["task"] = asyncio.create_task(expire_findout_format(context, job_id))
+        if record.get("cleanup_ids"):
+            queue_transient_cleanup(record["chat_id"], record["cleanup_ids"], SEARCH_UI_TIMEOUT, active=True)
 
 
 async def expire_findout_format(context, job_id: str) -> None:
@@ -3695,9 +3780,10 @@ async def expire_findout_format(context, job_id: str) -> None:
             return
         timers.pop(job_id, None)
         context.user_data.setdefault("jobs", {}).pop(job_id, None)
+        forget_format_cleanup(record)
         try:
             if not await restore_track_card(context, job_id, record):
-                await context.bot.delete_message(chat_id=record["chat_id"], message_id=record["message_id"])
+                await delete_format_messages(context, record)
         except TelegramError:
             pass
 

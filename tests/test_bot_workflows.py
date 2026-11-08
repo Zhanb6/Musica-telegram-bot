@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import sqlite3
 import subprocess
 import tempfile
@@ -14,6 +15,8 @@ from unittest.mock import AsyncMock, patch
 
 import bot
 from mutagen.id3 import APIC, ID3
+from telegram import Bot, Update
+from telegram.request import BaseRequest
 
 
 class FakeBot:
@@ -215,13 +218,13 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(mode=mode, url=url):
                     self.context.user_data["navigation"] = {(7, None): mode}
                     update = self.navigation_update(url)
-                    with patch.object(bot, "receive_url", new_callable=AsyncMock) as receive:
+                    with patch.object(bot, "receive_url_impl", new_callable=AsyncMock) as receive:
                         await bot.receive_text(update, self.context)
                     receive.assert_awaited_once_with(update, self.context)
         await bot.receive_text(self.navigation_update("🔗 По ссылке"), self.context)
         self.assertEqual(self.context.user_data["navigation"][(7, None)], "link")
         invalid = self.navigation_update("some text")
-        with patch.object(bot, "findout_command", new_callable=AsyncMock) as search:
+        with patch.object(bot, "findout_command_impl", new_callable=AsyncMock) as search:
             await bot.receive_text(invalid, self.context)
         search.assert_not_awaited()
         self.assertIn("ссылка", invalid.effective_message.reply_text.await_args.args[0])
@@ -252,7 +255,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_navigation_pending_input_is_isolated_by_chat_topic_and_unknown_text_opens_menu(self):
         await bot.receive_text(self.navigation_update("🔎 Найти песню", thread_id=77), self.context)
-        with patch.object(bot, "findout_command", new_callable=AsyncMock) as search:
+        with patch.object(bot, "findout_command_impl", new_callable=AsyncMock) as search:
             for chat_id, topic in ((8, 77), (7, None), (7, 78)):
                 update = self.navigation_update("Adele Hello", chat_id, topic)
                 await bot.receive_text(update, self.context)
@@ -287,6 +290,220 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         commands = self.fake_bot.set_my_commands.await_args.args[0]
         self.assertEqual(commands[0].command, "menu")
         self.assertIn("findout", [command.command for command in commands])
+
+    async def test_navigation_replaces_old_prompts_and_deletes_button_taps_before_search(self):
+        def update(text, incoming, reply):
+            result = self.navigation_update(text)
+            result.effective_message.message_id = incoming
+            result.effective_message.reply_text.return_value.message_id = reply
+            return result
+
+        await bot.receive_text(update("🎵 Скачать музыку", 101, 201), self.context)
+        await bot.receive_text(update("◀️ Назад", 102, 202), self.context)
+        await bot.receive_text(update("🔎 Найти песню", 103, 203), self.context)
+        self.assertEqual(self.context.user_data["navigation_prompts"], {(7, None): 203})
+        self.assertTrue({101, 102, 103, 201, 202}.issubset(set(self.fake_bot.deleted)))
+        self.context.args = []
+        with patch.object(bot, "search_youtube", return_value=[]):
+            await asyncio.wait_for(bot.receive_text(update("Adele Hello", 104, 204), self.context), 1)
+        self.assertIn(203, self.fake_bot.deleted)
+        self.assertNotIn((7, None), self.context.user_data["navigation_prompts"])
+
+    async def test_back_from_direct_url_removes_source_format_and_old_prompt_then_search(self):
+        link = self.navigation_update("🔗 По ссылке")
+        link.effective_message.reply_text.return_value.message_id = 201
+        await bot.receive_text(link, self.context)
+        url = self.navigation_update("https://youtu.be/video000071")
+        url.effective_message.message_id = 102
+        url.effective_message.reply_text.return_value.message_id = 202
+        await asyncio.wait_for(bot.receive_text(url, self.context), 1)
+        job_id = next(iter(self.context.user_data["jobs"]))
+        self.assertEqual(len(self.context.user_data["jobs"][job_id]), 6)
+        self.assertIn(201, self.fake_bot.deleted)
+        with closing(bot.history_connection()) as connection:
+            queued = connection.execute("SELECT message_id, active FROM transient_message_cleanup WHERE chat_id=7 AND active=1").fetchall()
+        self.assertEqual(set(queued), {(102, 1), (202, 1)})
+        back = self.navigation_update("◀️ Назад")
+        back.effective_message.message_id = 103
+        back.effective_message.reply_text.return_value.message_id = 203
+        await bot.receive_text(back, self.context)
+        self.assertTrue({102, 202, 103}.issubset(set(self.fake_bot.deleted)))
+        self.assertNotIn(job_id, self.context.user_data["jobs"])
+        self.assertNotIn(job_id, self.context.user_data["findout_format_timers"])
+        search = self.navigation_update("🔎 Найти песню")
+        search.effective_message.reply_text.return_value.message_id = 204
+        await bot.receive_text(search, self.context)
+        self.assertIn(203, self.fake_bot.deleted)
+        self.assertEqual(self.context.user_data["navigation_prompts"][(7, None)], 204)
+        with closing(bot.history_connection()) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM transient_message_cleanup WHERE active=1").fetchone()[0], 0)
+
+    async def test_direct_url_timeout_removes_source_and_menu_and_format_activity_renews_timer(self):
+        update = self.navigation_update("https://youtu.be/video000071")
+        update.effective_message.message_id = 101
+        update.effective_message.reply_text.return_value.message_id = 201
+        await bot.receive_url(update, self.context)
+        job_id = next(iter(self.context.user_data["jobs"]))
+        record = self.context.user_data["findout_format_timers"][job_id]
+        old_task = record["task"]
+        with closing(bot.history_connection()) as connection:
+            old_due = connection.execute("SELECT MAX(due_at) FROM transient_message_cleanup").fetchone()[0]
+        quality = FakeQuery(f"mp3:{job_id}")
+        quality.message.message_id = 201
+        with patch.object(bot.time, "time", return_value=old_due):
+            await bot.send_media(SimpleNamespace(callback_query=quality), self.context)
+        self.assertIsNot(record["task"], old_task)
+        with closing(bot.history_connection()) as connection:
+            self.assertGreater(connection.execute("SELECT MIN(due_at) FROM transient_message_cleanup").fetchone()[0], old_due)
+        record["task"].cancel()
+        with patch.object(bot, "SEARCH_UI_TIMEOUT", 0):
+            record["task"] = asyncio.create_task(bot.expire_findout_format(self.context, job_id))
+            await record["task"]
+        self.assertTrue({101, 201}.issubset(set(self.fake_bot.deleted)))
+        self.assertNotIn(job_id, self.context.user_data["jobs"])
+        with closing(bot.history_connection()) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM transient_message_cleanup").fetchone()[0], 0)
+
+    async def test_navigation_cleanup_isolated_by_chat_and_topic_and_preserves_active_download(self):
+        jobs = {}
+        for chat_id, topic, incoming, menu in ((7, 77, 101, 201), (7, 78, 102, 202), (8, 77, 103, 203)):
+            update = self.navigation_update("https://youtu.be/video000071", chat_id, topic)
+            update.effective_message.message_id = incoming
+            update.effective_message.reply_text.return_value.message_id = menu
+            await bot.receive_url(update, self.context)
+            jobs[(chat_id, topic)] = next(job_id for job_id, job in self.context.user_data["jobs"].items()
+                                         if (job[1], job[5]) == (chat_id, topic))
+        job_id = jobs[(7, 77)]
+        release = asyncio.Event()
+
+        async def held_delivery(*args, **kwargs):
+            await release.wait()
+
+        with patch.object(bot, "deliver_media", side_effect=held_delivery):
+            for data in (f"mp3:{job_id}", f"quality:{job_id}:mp3:192"):
+                query = FakeQuery(data)
+                query.message.message_id = 201
+                query.message.message_thread_id = 77
+                await bot.send_media(SimpleNamespace(callback_query=query), self.context)
+            with closing(bot.history_connection()) as connection:
+                rows = connection.execute("SELECT message_id FROM transient_message_cleanup WHERE chat_id=7").fetchall()
+            self.assertEqual(set(rows), {(102,), (202,)})
+            back = self.navigation_update("🏠 Главное меню", thread_id=77)
+            back.effective_message.message_id = 104
+            await bot.receive_text(back, self.context)
+            self.assertNotIn(101, self.fake_bot.deleted)
+            self.assertNotIn(201, self.fake_bot.deleted)
+            self.assertIn(jobs[(7, 78)], self.context.user_data["jobs"])
+            self.assertIn(jobs[(8, 77)], self.context.user_data["jobs"])
+            self.assertFalse(self.context.application.bot_data["active_batches"][job_id]["cancelled"])
+            release.set()
+            await asyncio.gather(*self.context.application.tasks)
+
+    async def test_rapid_navigation_transitions_keep_only_last_prompt_without_deadlock(self):
+        first = self.navigation_update("🎵 Скачать музыку")
+        first.effective_message.message_id = 101
+        second = self.navigation_update("🔎 Найти песню")
+        second.effective_message.message_id = 102
+
+        async def slow_reply(*args, **kwargs):
+            await asyncio.sleep(0.01)
+            return SimpleNamespace(message_id=201)
+
+        first.effective_message.reply_text.side_effect = slow_reply
+        second.effective_message.reply_text.return_value.message_id = 202
+        await asyncio.wait_for(asyncio.gather(bot.receive_text(first, self.context), bot.receive_text(second, self.context)), 1)
+        self.assertEqual(self.context.user_data["navigation"][(7, None)], "search")
+        self.assertEqual(self.context.user_data["navigation_prompts"], {(7, None): 202})
+        self.assertTrue({101, 102, 201}.issubset(set(self.fake_bot.deleted)))
+
+    async def test_group_and_forum_sdk_navigation_sends_all_replies_before_deleting_tap(self):
+        class RecordingRequest(BaseRequest):
+            def __init__(self):
+                self.calls = []
+                self.deleted = set()
+                self.next_id = 1000
+                self.chat = None
+
+            @property
+            def read_timeout(self):
+                return None
+
+            async def initialize(self):
+                pass
+
+            async def shutdown(self):
+                pass
+
+            async def do_request(self, url, method, request_data=None, **kwargs):
+                endpoint = url.rsplit("/", 1)[-1]
+                data = request_data.parameters if request_data else {}
+                self.calls.append((endpoint, data))
+                if endpoint == "getMe":
+                    result = {"id": 999, "is_bot": True, "first_name": "Bot", "username": "test_bot"}
+                elif endpoint == "deleteMessage":
+                    self.deleted.add((data["chat_id"], data["message_id"]))
+                    result = True
+                elif endpoint == "sendMessage":
+                    reply_id = data.get("reply_parameters", {}).get("message_id")
+                    if (data["chat_id"], reply_id) in self.deleted:
+                        return 400, json.dumps({"ok": False, "error_code": 400,
+                                                "description": "Bad Request: message to be replied not found"}).encode()
+                    self.next_id += 1
+                    result = {"message_id": self.next_id, "date": 1, "chat": self.chat, "text": data["text"]}
+                    if data.get("message_thread_id") is not None:
+                        result.update(message_thread_id=data["message_thread_id"], is_topic_message=True)
+                else:
+                    raise AssertionError(endpoint)
+                return 200, json.dumps({"ok": True, "result": result}).encode()
+
+        request = RecordingRequest()
+        sdk_bot = Bot("123456:TEST", request=request, get_updates_request=request)
+        await sdk_bot.initialize()
+        self.context.bot = sdk_bot
+        self.context.application.bot = sdk_bot
+        try:
+            for chat_id, kind, topic in ((-7, "group", None), (-8, "supergroup", 77)):
+                request.chat = {"id": chat_id, "type": kind, "title": "Music"}
+                if topic is not None:
+                    request.chat["is_forum"] = True
+                for incoming, text in ((101, "🎵 Скачать музыку"), (102, "🔎 Найти песню"), (103, "🎵 Моя музыка")):
+                    with self.subTest(kind=kind, text=text):
+                        message = {"message_id": incoming, "date": 1, "chat": request.chat, "text": text,
+                                   "from": {"id": 42, "is_bot": False, "first_name": "User"}}
+                        if topic is not None:
+                            message.update(message_thread_id=topic, is_topic_message=True)
+                        update = Update.de_json({"update_id": incoming, "message": message}, sdk_bot)
+                        start = len(request.calls)
+                        with patch.object(bot, "topic_library_groups", return_value=[("Artist", [{"title": "Song"}])]):
+                            await bot.receive_text(update, self.context)
+                        calls = request.calls[start:]
+                        sends = [(i, payload) for i, (endpoint, payload) in enumerate(calls) if endpoint == "sendMessage"]
+                        tap_delete = next(i for i, (endpoint, payload) in enumerate(calls)
+                                          if endpoint == "deleteMessage" and payload["message_id"] == incoming)
+                        self.assertEqual(len(sends), 2 if text == "🎵 Моя музыка" else 1)
+                        self.assertTrue(all(i < tap_delete for i, _ in sends))
+                        self.assertNotIn("reply_parameters", sends[0][1])
+                        if text == "🎵 Моя музыка":
+                            self.assertEqual(sends[1][1]["reply_parameters"]["message_id"], incoming)
+                        if topic is not None:
+                            self.assertTrue(all(payload["message_thread_id"] == topic for _, payload in sends))
+        finally:
+            await sdk_bot.shutdown()
+
+    async def test_navigation_prompt_is_persisted_and_restart_resumes_its_cleanup(self):
+        update = self.navigation_update("🔎 Найти песню")
+        update.effective_message.reply_text.return_value.message_id = 201
+        await bot.receive_text(update, self.context)
+        with closing(bot.history_connection()) as connection:
+            row = connection.execute("SELECT chat_id, message_id, active FROM transient_message_cleanup").fetchone()
+        self.assertEqual(row, (7, 201, 0))
+        with patch.object(bot, "delete_transient_messages", new_callable=AsyncMock) as cleanup:
+            bot.resume_transient_cleanup(self.fake_bot)
+            await asyncio.sleep(0)
+        self.assertEqual(cleanup.await_count, 1)
+        self.assertEqual(cleanup.await_args.args[:3], (self.fake_bot, 7, (201,)))
+        self.assertGreater(cleanup.await_args.args[3], 0)
+        self.assertLessEqual(cleanup.await_args.args[3], bot.SEARCH_UI_TIMEOUT)
 
     async def test_rename_topic_keeps_thread_mapping(self):
         with closing(bot.history_connection()) as connection:
